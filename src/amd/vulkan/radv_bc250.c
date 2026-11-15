@@ -6930,6 +6930,7 @@ radv_bc250_task_storage_reset(struct radv_cmd_buffer *cmd_buffer, bool destroy)
       cmd_buffer->bc250_task_scratch_cleared = false;
       cmd_buffer->bc250_task_scratch_used = false;
       cmd_buffer->bc250_shared_task_scratch_used = false;
+      cmd_buffer->bc250_last_task_scratch_va = 0;
       cmd_buffer->bc250_task_app_consts_valid = false;
       cmd_buffer->bc250_task_desc_sets_valid = false;
       return;
@@ -6939,6 +6940,7 @@ radv_bc250_task_storage_reset(struct radv_cmd_buffer *cmd_buffer, bool destroy)
    cmd_buffer->bc250_task_tail_pool_used = 0;
    cmd_buffer->bc250_task_scratch_used = false;
    cmd_buffer->bc250_shared_task_scratch_used = false;
+   cmd_buffer->bc250_last_task_scratch_va = 0;
    cmd_buffer->bc250_task_app_consts_valid = false;
    cmd_buffer->bc250_task_desc_sets_valid = false;
    if (cmd_buffer->bc250_task_scratch_next_size > cmd_buffer->bc250_task_scratch_size) {
@@ -6967,8 +6969,9 @@ bc250_alloc_persist_task_scratch(struct radv_cmd_buffer *cmd_buffer,
    const uint64_t required = (uint64_t)BC250_PERSIST_PAYLOAD_OFFSET +
                              (uint64_t)count * pipeline->bc250_payload_stride;
    const uint64_t alloc_size = MAX2(ALIGN_POT(required, 4096ull), BC250_PERSIST_MIN_SCRATCH);
-   if (bc250_alloc_shared_task_scratch(cmd_buffer, required, address))
-      return true;
+   uint64_t selected_va;
+   if (bc250_alloc_shared_task_scratch(cmd_buffer, required, &selected_va))
+      goto selected;
    if (!cmd_buffer->bc250_task_scratch_bo) {
       if (bc250_create_persist_task_scratch(cmd_buffer, alloc_size) != VK_SUCCESS)
          return false;
@@ -6985,7 +6988,17 @@ bc250_alloc_persist_task_scratch(struct radv_cmd_buffer *cmd_buffer,
       radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, cmd_buffer->bc250_task_scratch_bo);
       cmd_buffer->bc250_task_scratch_used = true;
    }
-   *address = radv_buffer_get_va(cmd_buffer->bc250_task_scratch_bo);
+   selected_va = radv_buffer_get_va(cmd_buffer->bc250_task_scratch_bo);
+selected:
+   /* A recording can use the shared pool for an ordinary draw and a larger
+    * private pool later. Constants and the descriptor table live at fixed
+    * offsets in that pool, so cached contents are valid only for one VA. */
+   if (cmd_buffer->bc250_last_task_scratch_va != selected_va) {
+      cmd_buffer->bc250_last_task_scratch_va = selected_va;
+      cmd_buffer->bc250_task_app_consts_valid = false;
+      cmd_buffer->bc250_task_desc_sets_valid = false;
+   }
+   *address = selected_va;
    return true;
 }
 
@@ -7368,12 +7381,13 @@ bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
       struct radv_shader *frag_s = cmd_buffer->state.shaders[MESA_SHADER_FRAGMENT];
       struct radv_shader *idx_setup_s = idx_setup_base ? idx_setup_base->shaders[MESA_SHADER_COMPUTE] : NULL;
       struct radv_shader *idx_pass_s = idx_pass_base ? idx_pass_base->shaders[MESA_SHADER_COMPUTE] : NULL;
-      if (!pipeline_cache)
+      if (!pipeline_cache) {
          bc250_task_tail_entry_clear(device, &cmd_buffer->vk.base, cache_slot);
-      cache_slot->pipeline_id = pipeline->bc250_tail_id;
-      cache_slot->scratch_va = address;
-      cache_slot->view_mask = view_mask;
-      cache_slot->opt_ready = opt_ready;
+         cache_slot->pipeline_id = pipeline->bc250_tail_id;
+         cache_slot->scratch_va = address;
+         cache_slot->view_mask = view_mask;
+         cache_slot->opt_ready = opt_ready;
+      }
       cache_slot->stream = tail;
       cache_slot->const_bo = const_bo;
       cache_slot->shaders[0] = prod_s ? radv_shader_ref(prod_s) : NULL;

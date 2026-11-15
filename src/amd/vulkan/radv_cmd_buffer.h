@@ -647,6 +647,7 @@ struct radv_cmd_buffer {
    bool bc250_task_scratch_cleared;
    bool bc250_task_scratch_used;
    bool bc250_shared_task_scratch_used;
+   uint64_t bc250_last_task_scratch_va;
    bool bc250_task_app_consts_valid;
    bool bc250_task_desc_sets_valid;
    bool bc250_inherit_descriptors;
