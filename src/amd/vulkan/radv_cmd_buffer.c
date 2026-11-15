@@ -7398,19 +7398,21 @@ radv_upload_graphics_shader_descriptors(struct radv_cmd_buffer *cmd_buffer)
       cmd_buffer->state.dirty &= ~RADV_CMD_DIRTY_STREAMOUT_BUFFER;
    }
 
-   if (descriptors_state->dirty) {
-      radv_flush_descriptors(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
-      descriptors_state->dirty = 0;
-   }
+   if (!cmd_buffer->bc250_inherit_descriptors) {
+      if (descriptors_state->dirty) {
+         radv_flush_descriptors(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
+         descriptors_state->dirty = 0;
+      }
 
-   if (descriptors_state->dirty_heaps) {
-      radv_flush_descriptor_heaps(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
-      descriptors_state->dirty_heaps = 0;
-   }
+      if (descriptors_state->dirty_heaps) {
+         radv_flush_descriptor_heaps(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
+         descriptors_state->dirty_heaps = 0;
+      }
 
-   if (descriptors_state->dirty_dynamic && descriptors_state->dynamic_offset_count) {
-      radv_flush_dynamic_descriptors(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
-      descriptors_state->dirty_dynamic = false;
+      if (descriptors_state->dirty_dynamic && descriptors_state->dynamic_offset_count) {
+         radv_flush_dynamic_descriptors(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
+         descriptors_state->dirty_dynamic = false;
+      }
    }
 
    const VkShaderStageFlags pc_stages = radv_must_flush_constants(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
@@ -14399,19 +14401,21 @@ radv_before_taskmesh_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_
    struct radv_descriptor_state *descriptors_state =
       radv_get_descriptors_state(cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS);
 
-   if (descriptors_state->dirty) {
-      radv_flush_descriptors(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
-      descriptors_state->dirty = 0;
-   }
+   if (!cmd_buffer->bc250_inherit_descriptors) {
+      if (descriptors_state->dirty) {
+         radv_flush_descriptors(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
+         descriptors_state->dirty = 0;
+      }
 
-   if (descriptors_state->dirty_heaps) {
-      radv_flush_descriptor_heaps(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
-      descriptors_state->dirty_heaps = 0;
-   }
+      if (descriptors_state->dirty_heaps) {
+         radv_flush_descriptor_heaps(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
+         descriptors_state->dirty_heaps = 0;
+      }
 
-   if (descriptors_state->dirty_dynamic && descriptors_state->dynamic_offset_count) {
-      radv_flush_dynamic_descriptors(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
-      descriptors_state->dirty_dynamic = false;
+      if (descriptors_state->dirty_dynamic && descriptors_state->dynamic_offset_count) {
+         radv_flush_dynamic_descriptors(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
+         descriptors_state->dirty_dynamic = false;
+      }
    }
 
    const VkShaderStageFlags pc_stages = radv_must_flush_constants(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);

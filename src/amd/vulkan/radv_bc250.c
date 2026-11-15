@@ -7052,6 +7052,13 @@ bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
       radeon_check_space(device->ws, tail->b, BC250_DGC_TAIL_BYTES / 4);
    uint32_t *dgc_buf = tail->b->buf;
    const enum radv_cmd_flush_bits saved_flush = cmd_buffer->state.flush_bits;
+   struct radv_compute_pipeline *saved_compute_pipeline = cmd_buffer->state.compute_pipeline;
+   struct radv_shader *saved_compute_shader = cmd_buffer->state.shaders[MESA_SHADER_COMPUTE];
+   const VkShaderStageFlags saved_active_stages = cmd_buffer->state.active_stages;
+   const uint32_t saved_prefetch_L2 = cmd_buffer->state.prefetch_L2_mask;
+   const VkShaderStageFlags saved_pc_stages = cmd_buffer->push_constant_stages;
+   const struct radv_push_constant_state saved_comp_pc =
+      cmd_buffer->push_constant_state[vk_to_bind_point(VK_PIPELINE_BIND_POINT_COMPUTE)];
    const bool saved_inherit_gfx = cmd_buffer->bc250_dgc_inherit_graphics_state;
    const bool saved_inherit_desc = cmd_buffer->bc250_inherit_descriptors;
    struct radv_descriptor_state *comp_ds =
@@ -7074,9 +7081,15 @@ bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
    uint64_t saved_sample_chain = cmd_buffer->upload.bc250_sample_chain;
 
    if (cache_slot) {
-      /* Chunk 0 already bound and flushed live compute + graphics descriptors on
+      /* Clear compute pipeline + shader together before recording on tail so
+       * radv_meta_end never rebinds an external/setup compute BO into tail->b,
+       * and restore the full compute tuple atomically after switching back.
+       * Chunk 0 already bound and flushed live compute + graphics descriptors on
        * main_cs; suppress descriptor re-emission inside cached tail slots 1..1023
        * so the tail inherits each draw's live descriptor bindings. */
+      cmd_buffer->state.compute_pipeline = NULL;
+      cmd_buffer->state.shaders[MESA_SHADER_COMPUTE] = NULL;
+      cmd_buffer->state.active_stages &= ~VK_SHADER_STAGE_COMPUTE_BIT;
       cmd_buffer->bc250_dgc_inherit_graphics_state = true;
       cmd_buffer->bc250_inherit_descriptors = true;
       comp_ds->dirty = 0;
@@ -7108,6 +7121,12 @@ bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
    const bool fixed_overflow = cmd_buffer->bc250_fixed_upload == 2;
    if (cache_slot) {
       assert(cmd_buffer->upload.upload_bo == const_bo);
+      cmd_buffer->state.compute_pipeline = saved_compute_pipeline;
+      cmd_buffer->state.shaders[MESA_SHADER_COMPUTE] = saved_compute_shader;
+      cmd_buffer->state.active_stages = saved_active_stages;
+      cmd_buffer->state.prefetch_L2_mask = saved_prefetch_L2;
+      cmd_buffer->push_constant_stages = saved_pc_stages;
+      cmd_buffer->push_constant_state[vk_to_bind_point(VK_PIPELINE_BIND_POINT_COMPUTE)] = saved_comp_pc;
       cmd_buffer->bc250_fixed_upload = 0;
       cmd_buffer->bc250_dgc_inherit_graphics_state = saved_inherit_gfx;
       cmd_buffer->bc250_inherit_descriptors = saved_inherit_desc;
