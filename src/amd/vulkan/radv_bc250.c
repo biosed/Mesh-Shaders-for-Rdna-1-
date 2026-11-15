@@ -7081,8 +7081,10 @@ bc250_can_cache_task_tail(const struct radv_cmd_buffer *cmd_buffer,
         (!ms->info.bc250_compat_constants &&
          (ms->info.loads_push_constants || ms->info.inline_push_constant_mask))))
       return false;
-   if (fs && (fs->info.ps.has_epilog ||
-              (!fs->info.bc250_compat_constants && (fs->info.loads_push_constants || fs->info.inline_push_constant_mask))))
+   if (fs && !radv_bc250_task_tail_fragment_cache_eligible(fs->info.ps.has_epilog,
+                                                            fs->info.bc250_compat_constants,
+                                                            fs->info.loads_push_constants,
+                                                            fs->info.inline_push_constant_mask))
       return false;
    if (cmd_buffer->state.active_pipeline_queries || cmd_buffer->state.active_occlusion_queries ||
        cmd_buffer->state.active_prims_gen_queries || cmd_buffer->state.active_emulated_prims_gen_queries ||
@@ -7420,7 +7422,9 @@ bc250_invalidate_after_task_tail(struct radv_cmd_buffer *cmd_buffer)
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    radv_init_cmd_stream(device, cmd_buffer->cs, AMD_IP_GFX);
    cmd_buffer->state.dirty |= RADV_CMD_DIRTY_GRAPHICS_PIPELINE | RADV_CMD_DIRTY_COMPUTE_PIPELINE |
-                              RADV_CMD_DIRTY_PS_STATE | RADV_CMD_DIRTY_NGG_STATE | RADV_CMD_DIRTY_INDEX_BUFFER;
+                              RADV_CMD_DIRTY_PS_STATE | RADV_CMD_DIRTY_PS_EPILOG_SHADER |
+                              RADV_CMD_DIRTY_PS_EPILOG_STATE | RADV_CMD_DIRTY_NGG_STATE |
+                              RADV_CMD_DIRTY_INDEX_BUFFER;
    cmd_buffer->state.dirty_dynamic |= cmd_buffer->state.graphics_pipeline->needed_dynamic_state;
    cmd_buffer->state.emitted_ps = NULL;
    cmd_buffer->state.last_index_type = -1;

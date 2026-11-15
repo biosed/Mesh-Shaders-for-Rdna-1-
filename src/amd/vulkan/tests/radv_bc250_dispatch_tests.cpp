@@ -82,6 +82,15 @@ TEST(radv_bc250_task_tail, constant_storage_scales_with_indirect_slots)
    EXPECT_EQ(radv_bc250_task_tail_const_size(true, 4, 2, 8), 36u * 1024u);
 }
 
+TEST(radv_bc250_task_tail, dynamic_fragment_epilog_inherits_slot_zero_state)
+{
+   EXPECT_TRUE(radv_bc250_task_tail_fragment_cache_eligible(false, false, false, 0));
+   EXPECT_TRUE(radv_bc250_task_tail_fragment_cache_eligible(true, false, false, 0));
+   EXPECT_TRUE(radv_bc250_task_tail_fragment_cache_eligible(true, true, true, ~0ull));
+   EXPECT_FALSE(radv_bc250_task_tail_fragment_cache_eligible(true, false, true, 0));
+   EXPECT_FALSE(radv_bc250_task_tail_fragment_cache_eligible(true, false, false, 1));
+}
+
 TEST(radv_bc250_task_tail, shared_scratch_requires_serial_native_queue)
 {
    constexpr uint64_t capacity = 36ull << 20;

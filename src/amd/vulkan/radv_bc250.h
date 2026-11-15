@@ -65,6 +65,19 @@ radv_bc250_task_tail_const_size(bool task_idx, unsigned passes, unsigned views,
       bytes = 4096u;
    return (bytes + 4095u) & ~4095ull;
 }
+/* A cached Task tail records slots after slot 0 with graphics-state emission
+ * suppressed.  The live draw's slot 0 has already selected and made resident
+ * its dynamic PS epilog, so epilogs do not make the inherited tail variant.
+ * Fragment push constants still do: they can be consumed by commands recorded
+ * into the tail itself. */
+static inline bool
+radv_bc250_task_tail_fragment_cache_eligible(bool has_epilog, bool compat_constants,
+                                             bool loads_push_constants,
+                                             uint64_t inline_push_constant_mask)
+{
+   (void)has_epilog;
+   return compat_constants || (!loads_push_constants && !inline_push_constant_mask);
+}
 void radv_bc250_task_tails_free(struct radv_cmd_buffer *cmd_buffer);
 void radv_bc250_task_storage_reset(struct radv_cmd_buffer *cmd_buffer, bool destroy);
 void radv_bc250_pipeline_tails_finish(struct radv_device *device,
