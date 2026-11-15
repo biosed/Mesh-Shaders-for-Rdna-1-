@@ -57,9 +57,12 @@ static inline uint64_t
 radv_bc250_task_tail_const_size(bool task_idx, unsigned passes, unsigned views,
                                 unsigned indirect_slots)
 {
-   views = MAX2(views, 1);
+   if (!views)
+      views = 1;
    const uint64_t per_slot = task_idx ? (uint64_t)views * (256u + (uint64_t)passes * 512u) : 256u;
-   uint64_t bytes = MAX2((uint64_t)indirect_slots * per_slot, 4096u);
+   uint64_t bytes = (uint64_t)indirect_slots * per_slot;
+   if (bytes < 4096u)
+      bytes = 4096u;
    return (bytes + 4095u) & ~4095ull;
 }
 void radv_bc250_task_tails_free(struct radv_cmd_buffer *cmd_buffer);
