@@ -15575,16 +15575,46 @@ radv_emit_dispatch_packets(struct radv_cmd_buffer *cmd_buffer, const struct radv
 }
 
 static void
+radv_bc250_load_compute_descriptor_sets(struct radv_cmd_buffer *cmd_buffer)
+{
+   const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   const struct radv_shader *shader = cmd_buffer->state.shaders[MESA_SHADER_COMPUTE];
+   struct radv_cmd_stream *cs = radv_get_pm4_cs(cmd_buffer);
+   const struct radv_userdata_locations *locs = &shader->info.user_sgprs_locs;
+   const uint64_t table = cmd_buffer->bc250_inherit_desc_va;
+   const uint32_t indirect = radv_get_user_sgpr_loc(shader, AC_UD_INDIRECT_DESCRIPTORS);
+
+   assert(table && !locs->descriptor_heaps_enabled);
+   assert(!radv_get_user_sgpr_loc(shader, AC_UD_DYNAMIC_DESCRIPTORS));
+   assert(!radv_get_user_sgpr_loc(shader, AC_UD_DYNAMIC_DESCRIPTORS_OFFSET_ADDR));
+   if (indirect) {
+      radv_emit_userdata_address(device, cs, shader, AC_UD_INDIRECT_DESCRIPTORS, table);
+      return;
+   }
+
+   u_foreach_bit (set, locs->descriptor_sets_enabled) {
+      const unsigned reg = shader->info.user_data_0 + locs->descriptor_sets[set].sgpr_idx * 4;
+      const uint64_t va = table + set * sizeof(uint32_t);
+      radeon_begin(cs);
+      radeon_emit(PKT3(PKT3_LOAD_SH_REG_INDEX, 3, 0));
+      radeon_emit(va);
+      radeon_emit(va >> 32);
+      radeon_emit((reg - SI_SH_REG_OFFSET) >> 2);
+      radeon_emit(1);
+      radeon_end();
+   }
+}
+
+static void
 radv_upload_compute_shader_descriptors(struct radv_cmd_buffer *cmd_buffer, VkPipelineBindPoint bind_point)
 {
    struct radv_descriptor_state *descriptors_state = radv_get_descriptors_state(cmd_buffer, bind_point);
 
-   /* A cached BC250 task tail executes immediately after chunk 0, which has
-    * already established this draw's live compute descriptors. Meta binding
-    * marks them dirty again while recording the side stream; emitting them
-    * there would bake the first draw's set VAs into a stream reused by later
-    * draws. Inherit sets, heaps, and dynamic descriptors from chunk 0, while
-    * still flushing the tail's private constants below. */
+   /* A cached BC250 task tail executes immediately after chunk 0. Meta binding
+    * marks descriptors dirty again while recording the side stream; ordinary
+    * writes would bake the first draw's set VAs into a stream reused by later
+    * draws. Reload each compute shader's SGPR layout from the per-draw table
+    * instead. Cache admission rejects descriptor heaps and dynamic buffers. */
    if (!cmd_buffer->bc250_inherit_descriptors) {
       if (descriptors_state->dirty) {
          radv_flush_descriptors(cmd_buffer, VK_SHADER_STAGE_COMPUTE_BIT, bind_point);
@@ -15600,6 +15630,8 @@ radv_upload_compute_shader_descriptors(struct radv_cmd_buffer *cmd_buffer, VkPip
          radv_flush_dynamic_descriptors(cmd_buffer, VK_SHADER_STAGE_COMPUTE_BIT, bind_point);
          descriptors_state->dirty_dynamic = false;
       }
+   } else {
+      radv_bc250_load_compute_descriptor_sets(cmd_buffer);
    }
 
    const VkShaderStageFlags stages =

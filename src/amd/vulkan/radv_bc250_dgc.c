@@ -393,6 +393,7 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
    cmd->bc250_task_scratch_used = false;
    cmd->bc250_task_app_consts_valid = false;
    cmd->bc250_inherit_descriptors = false;
+   cmd->bc250_inherit_desc_va = 0;
    cmd->bc250_fixed_upload = 0;
    util_dynarray_init(&cmd->bc250_task_tail_pool, NULL);
    cmd->bc250_task_tail_pool_used = 0;

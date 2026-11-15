@@ -73,6 +73,14 @@ TEST(radv_bc250_task_idx, shared_storage_requires_one_unprotected_queue)
    EXPECT_FALSE(radv_bc250_task_idx_shared_eligible(true, true, false, 1, 1));
 }
 
+TEST(radv_bc250_task_tail, constant_storage_scales_with_indirect_slots)
+{
+   EXPECT_EQ(radv_bc250_task_tail_const_size(1), 768u * 1024u);
+   EXPECT_EQ(radv_bc250_task_tail_const_size(96), 768u * 1024u);
+   EXPECT_EQ(radv_bc250_task_tail_const_size(256), 2u * 1024u * 1024u);
+   EXPECT_EQ(radv_bc250_task_tail_const_size(1024), 8u * 1024u * 1024u);
+}
+
 TEST_F(radv_bc250_dispatch_test, row_major_32bit)
 {
    coordinates<uint32_t>({{1, 1, 1}, {17, 1, 1}, {1, 13, 1}, {1, 1, 11}, {7, 5, 3}, {31, 19, 17}});

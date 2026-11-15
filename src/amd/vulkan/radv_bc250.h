@@ -42,6 +42,15 @@ radv_bc250_task_idx_shared_eligible(bool task_persist, bool primary, bool idx_de
 {
    return task_persist && primary && !idx_debug && queue_count == 1 && protected_queue_count == 0;
 }
+#define RADV_BC250_TASK_TAIL_MIN_CONST_SIZE (768u * 1024u)
+static inline uint64_t
+radv_bc250_task_tail_const_size(unsigned indirect_slots)
+{
+   uint64_t bytes = (uint64_t)indirect_slots * 8192u;
+   if (bytes < RADV_BC250_TASK_TAIL_MIN_CONST_SIZE)
+      bytes = RADV_BC250_TASK_TAIL_MIN_CONST_SIZE;
+   return (bytes + 4095u) & ~4095ull;
+}
 void radv_bc250_task_tails_free(struct radv_cmd_buffer *cmd_buffer);
 void radv_bc250_task_storage_reset(struct radv_cmd_buffer *cmd_buffer, bool destroy);
 /* RADV_BC250_TASK_TAIL in DGC: the slots after the first start this far into the 1 MiB program. */

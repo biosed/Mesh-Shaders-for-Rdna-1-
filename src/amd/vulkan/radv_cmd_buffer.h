@@ -513,7 +513,8 @@ struct radv_bc250_task_tail_entry {
    uint32_t used_epoch;
    struct radv_cmd_stream *stream;
    struct radeon_winsys_bo *const_bo;
-   struct radv_shader *shaders[3];
+   /* Producer, graphics consumer, fragment, index setup and index pass. */
+   struct radv_shader *shaders[5];
 };
 
 struct radv_cmd_stream {
@@ -660,6 +661,9 @@ struct radv_cmd_buffer {
    bool bc250_task_scratch_used;
    bool bc250_task_app_consts_valid;
    bool bc250_inherit_descriptors;
+   /* Stable table of the current graphics descriptor-set VAs. Cached Task
+    * tails reload each compute shader's own SGPR layout from it. */
+   uint64_t bc250_inherit_desc_va;
    uint8_t bc250_fixed_upload;
    uint8_t bc250_task_app_consts[MAX_PUSH_CONSTANTS_SIZE];
    struct util_dynarray bc250_task_tail_pool;

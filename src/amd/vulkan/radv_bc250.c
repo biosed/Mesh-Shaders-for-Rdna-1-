@@ -4196,6 +4196,13 @@ bc250_lower_application_constants(nir_builder *b, nir_intrinsic_instr *intrin, v
    return true;
 }
 
+static bool
+bc250_lower_task_idx_application_constants(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
+{
+   (void)data;
+   return bc250_lower_application_constants(b, intrin, (void *)1);
+}
+
 /* chunk: producer chunk size (power of two, at most 32768 so one chunk is a single dispatch dimension); the
  * record is split into BC250_MAX_TASK_TOTAL / chunk slots. */
 static nir_shader *
@@ -6769,9 +6776,10 @@ radv_bc250_task_tails_free(struct radv_cmd_buffer *cmd_buffer)
 #define BC250_PERSIST_APP_OFFSET      BC250_PERSIST_XYZ_BYTES
 #define BC250_PERSIST_SLOT_OFFSET     (BC250_PERSIST_APP_OFFSET + MAX_PUSH_CONSTANTS_SIZE)
 #define BC250_PERSIST_ARGS_OFFSET     (BC250_PERSIST_SLOT_OFFSET + (unsigned)sizeof(struct bc250_task_slot))
-#define BC250_PERSIST_PAYLOAD_OFFSET  ALIGN_POT(BC250_PERSIST_ARGS_OFFSET + BC250_INDIRECT_CHUNKS * 16u, 256u)
+#define BC250_PERSIST_DESC_OFFSET     (BC250_PERSIST_ARGS_OFFSET + BC250_INDIRECT_CHUNKS * 16u)
+#define BC250_PERSIST_DESC_BYTES      (MAX_SETS * (unsigned)sizeof(uint32_t))
+#define BC250_PERSIST_PAYLOAD_OFFSET  ALIGN_POT(BC250_PERSIST_DESC_OFFSET + BC250_PERSIST_DESC_BYTES, 256u)
 #define BC250_PERSIST_MIN_SCRATCH     (12ull << 20)
-#define BC250_PERSIST_TAIL_CONST_SIZE (768u * 1024u)
 
 static void
 bc250_task_tail_entry_clear(struct radv_device *device, struct vk_object_base *owner,
@@ -6915,6 +6923,30 @@ bc250_emit_task_write_data(struct radv_cmd_buffer *cmd_buffer, uint64_t va,
                                    RADV_CMD_FLAG_INV_L2;
 }
 
+static void
+bc250_emit_task_descriptor_table(struct radv_cmd_buffer *cmd_buffer, uint64_t va)
+{
+   const struct radv_descriptor_state *descriptors =
+      radv_get_descriptors_state(cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS);
+   uint32_t sets[MAX_SETS] = {0};
+   u_foreach_bit (set, descriptors->valid) {
+      const struct radv_descriptor_set *descriptor = descriptors->sets[set];
+      const uint64_t set_va = descriptor ? descriptor->header.va : descriptors->descriptor_buffers[set];
+      sets[set] = (uint32_t)set_va;
+   }
+   bc250_emit_task_write_data(cmd_buffer, va, sets, sizeof(sets));
+}
+
+static bool
+bc250_task_tail_shader_descriptors_supported(const struct radv_shader *shader)
+{
+   if (!shader)
+      return true;
+   return !shader->info.user_sgprs_locs.descriptor_heaps_enabled &&
+          !radv_get_user_sgpr_loc(shader, AC_UD_DYNAMIC_DESCRIPTORS) &&
+          !radv_get_user_sgpr_loc(shader, AC_UD_DYNAMIC_DESCRIPTORS_OFFSET_ADDR);
+}
+
 static bool
 bc250_can_cache_task_tail(const struct radv_cmd_buffer *cmd_buffer,
                           const struct radv_graphics_pipeline *pipeline, bool dgc)
@@ -6925,6 +6957,16 @@ bc250_can_cache_task_tail(const struct radv_cmd_buffer *cmd_buffer,
        pipeline->base.type != RADV_PIPELINE_GRAPHICS || !pipeline->bc250_tail_id)
       return false;
    if (pipeline->bc250_task_idx && !device->bc250_task_idx_shared_bo)
+      return false;
+   VK_FROM_HANDLE(radv_pipeline, task_base, pipeline->bc250_task_pipeline);
+   VK_FROM_HANDLE(radv_pipeline, idx_setup_base, pipeline->bc250_idx_setup);
+   VK_FROM_HANDLE(radv_pipeline, idx_pass_base, pipeline->bc250_idx_cs_ind);
+   if (!bc250_task_tail_shader_descriptors_supported(
+          task_base ? task_base->shaders[MESA_SHADER_COMPUTE] : NULL) ||
+       !bc250_task_tail_shader_descriptors_supported(
+          idx_setup_base ? idx_setup_base->shaders[MESA_SHADER_COMPUTE] : NULL) ||
+       !bc250_task_tail_shader_descriptors_supported(
+          idx_pass_base ? idx_pass_base->shaders[MESA_SHADER_COMPUTE] : NULL))
       return false;
    for (unsigned i = 0; i <= MESA_SHADER_MESH; i++) {
       if (cmd_buffer->state.shader_objs[i])
@@ -6989,6 +7031,7 @@ bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
    struct radv_bc250_task_tail_entry *cache_slot = NULL;
    struct radeon_winsys_bo *const_bo = NULL;
    uint8_t *const_map = NULL;
+   const uint64_t const_size = radv_bc250_task_tail_const_size(indirect_slots);
    bool from_pool = false;
 
    if (bc250_can_cache_task_tail(cmd_buffer, pipeline, dgc)) {
@@ -7023,7 +7066,7 @@ bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
             RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING |
             RADEON_FLAG_32BIT | RADEON_FLAG_GTT_WC |
             (device->bc250_env.local_bos ? RADEON_FLAG_PREFER_LOCAL_BO : 0);
-         if (radv_bo_create(device, &cmd_buffer->vk.base, BC250_PERSIST_TAIL_CONST_SIZE, 4096,
+         if (radv_bo_create(device, &cmd_buffer->vk.base, const_size, 4096,
                             device->ws->cs_domain(device->ws), cflags,
                             RADV_BO_PRIORITY_UPLOAD_BUFFER, 0, true, &const_bo) == VK_SUCCESS) {
             const_map = radv_buffer_map(device->ws, const_bo);
@@ -7066,6 +7109,7 @@ bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
       cmd_buffer->push_constant_state[vk_to_bind_point(VK_PIPELINE_BIND_POINT_COMPUTE)];
    const bool saved_inherit_gfx = cmd_buffer->bc250_dgc_inherit_graphics_state;
    const bool saved_inherit_desc = cmd_buffer->bc250_inherit_descriptors;
+   const uint64_t saved_inherit_desc_va = cmd_buffer->bc250_inherit_desc_va;
    struct radv_descriptor_state *comp_ds =
       radv_get_descriptors_state(cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE);
    struct radv_descriptor_state *gfx_ds =
@@ -7097,6 +7141,7 @@ bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
       cmd_buffer->state.active_stages &= ~VK_SHADER_STAGE_COMPUTE_BIT;
       cmd_buffer->bc250_dgc_inherit_graphics_state = true;
       cmd_buffer->bc250_inherit_descriptors = true;
+      cmd_buffer->bc250_inherit_desc_va = address + BC250_PERSIST_DESC_OFFSET;
       comp_ds->dirty = 0;
       comp_ds->dirty_dynamic = false;
       comp_ds->dirty_heaps = 0;
@@ -7107,7 +7152,7 @@ bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
       cmd_buffer->upload.upload_bo = const_bo;
       cmd_buffer->upload.map = const_map;
       cmd_buffer->upload.offset = 0;
-      cmd_buffer->upload.size = BC250_PERSIST_TAIL_CONST_SIZE;
+      cmd_buffer->upload.size = const_size;
       cmd_buffer->upload.bc250_sample_chain = 0;
       radv_cs_add_buffer(device->ws, tail->b, const_bo);
    }
@@ -7135,6 +7180,7 @@ bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
       cmd_buffer->bc250_fixed_upload = 0;
       cmd_buffer->bc250_dgc_inherit_graphics_state = saved_inherit_gfx;
       cmd_buffer->bc250_inherit_descriptors = saved_inherit_desc;
+      cmd_buffer->bc250_inherit_desc_va = saved_inherit_desc_va;
       comp_ds->dirty = saved_comp_dirty;
       comp_ds->dirty_dynamic = saved_comp_dirty_dyn;
       comp_ds->dirty_heaps = saved_comp_dirty_heaps;
@@ -7163,9 +7209,14 @@ bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
    if (cache_slot) {
       bc250_task_tail_entry_clear(device, &cmd_buffer->vk.base, cache_slot);
       VK_FROM_HANDLE(radv_pipeline, task_pipe_base, pipeline->bc250_task_pipeline);
+      VK_FROM_HANDLE(radv_pipeline, idx_setup_base, pipeline->bc250_idx_setup);
+      VK_FROM_HANDLE(radv_pipeline, idx_pass_base, pipeline->bc250_idx_cs_ind);
       struct radv_shader *prod_s = task_pipe_base ? task_pipe_base->shaders[MESA_SHADER_COMPUTE] : NULL;
-      struct radv_shader *mesh_s = cmd_buffer->state.shaders[MESA_SHADER_MESH];
+      struct radv_shader *consumer_s = pipeline->bc250_task_idx ?
+         cmd_buffer->state.shaders[MESA_SHADER_VERTEX] : cmd_buffer->state.shaders[MESA_SHADER_MESH];
       struct radv_shader *frag_s = cmd_buffer->state.shaders[MESA_SHADER_FRAGMENT];
+      struct radv_shader *idx_setup_s = idx_setup_base ? idx_setup_base->shaders[MESA_SHADER_COMPUTE] : NULL;
+      struct radv_shader *idx_pass_s = idx_pass_base ? idx_pass_base->shaders[MESA_SHADER_COMPUTE] : NULL;
       cache_slot->pipeline_id = pipeline->bc250_tail_id;
       cache_slot->scratch_va = address;
       cache_slot->view_mask = view_mask;
@@ -7175,9 +7226,11 @@ bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
       cache_slot->stream = tail;
       cache_slot->const_bo = const_bo;
       cache_slot->shaders[0] = prod_s ? radv_shader_ref(prod_s) : NULL;
-      cache_slot->shaders[1] = mesh_s ? radv_shader_ref(mesh_s) : NULL;
+      cache_slot->shaders[1] = consumer_s ? radv_shader_ref(consumer_s) : NULL;
       cache_slot->shaders[2] = frag_s ? radv_shader_ref(frag_s) : NULL;
-      radv_rmv_log_command_buffer_bo_create(device, const_bo, 0, BC250_PERSIST_TAIL_CONST_SIZE, 0);
+      cache_slot->shaders[3] = idx_setup_s ? radv_shader_ref(idx_setup_s) : NULL;
+      cache_slot->shaders[4] = idx_pass_s ? radv_shader_ref(idx_pass_s) : NULL;
+      radv_rmv_log_command_buffer_bo_create(device, const_bo, 0, const_size, 0);
       return tail;
    }
    if (!dgc && !from_pool)
@@ -7362,6 +7415,8 @@ bc250_draw_task(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint
    compute_descriptors->dirty |= compute_descriptors->valid;
    compute_descriptors->dirty_dynamic = true;
    compute_descriptors->dirty_heaps |= compute_descriptors->valid_heaps;
+   if (persist_scratch)
+      bc250_emit_task_descriptor_table(cmd_buffer, address + BC250_PERSIST_DESC_OFFSET);
 
    if (indirect_va) {
       /* The setup shader validates the record against the advertised limits,
@@ -8479,10 +8534,17 @@ bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline *pipe
          goto fail;
    }
    {
-      nir_shader *ind = task ? radv_bc250_idx_build_task_cs(mesh, provoking, output_bytes,
-                                                            bc250_lower_application_constants, payload_stride)
+      const bool draw_id_slot = task && device->compiler_info.bc250x.task_tail;
+      nir_shader *ind = task ? radv_bc250_idx_build_task_cs(
+                                 mesh, provoking, output_bytes,
+                                 draw_id_slot ? bc250_lower_task_idx_application_constants :
+                                                bc250_lower_application_constants,
+                                 payload_stride)
                              : radv_bc250_idx_build_cs(mesh, true, provoking, output_bytes,
                                                        bc250_lower_application_constants);
+      if (draw_id_slot)
+         NIR_PASS(_, ind, nir_shader_intrinsics_pass, bc250_lower_draw_id_slot,
+                  nir_metadata_control_flow, NULL);
       if (getenv("BC250_IDX_PRINT"))
          nir_print_shader(ind, stderr);
       ci.stage.module = vk_shader_module_handle_from_nir(ind);
@@ -8653,8 +8715,15 @@ radv_bc250_task_idx_pipeline_create(struct radv_device *device, const VkGraphics
       ralloc_free(task);
       return VK_ERROR_FEATURE_NOT_PRESENT;
    }
-   /* As the hybrid producer: application constants from the copied block, DrawID the draw's. */
-   NIR_PASS(_, task, nir_shader_intrinsics_pass, bc250_lower_application_constants, nir_metadata_control_flow, NULL);
+   /* As the hybrid producer: application constants from the copied block. A
+    * cached tail takes DrawID from the per-draw slot instead of its immutable
+    * private constant upload. */
+   const bool draw_id_slot = device->compiler_info.bc250x.task_tail;
+   NIR_PASS(_, task, nir_shader_intrinsics_pass, bc250_lower_application_constants,
+            nir_metadata_control_flow, draw_id_slot ? (void *)1 : NULL);
+   if (draw_id_slot)
+      NIR_PASS(_, task, nir_shader_intrinsics_pass, bc250_lower_draw_id_slot,
+               nir_metadata_control_flow, NULL);
 
    struct radv_graphics_pipeline route = {0};
    const struct bc250_idx_task_params params = {.task_payload_size = task->info.task_payload_size,
@@ -9593,7 +9662,7 @@ bc250_task_idx_shared_storage(struct radv_cmd_buffer *cmd_buffer, uint64_t *pool
 static bool
 bc250_idx_task_pass(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline, uint64_t records,
                     uint32_t max_count, uint64_t count_va, uint64_t payload, uint64_t application_constants,
-                    uint32_t draw_id, unsigned slot, unsigned view, uint32_t draw_view_mask,
+                    uint64_t task_slot, uint32_t draw_id, unsigned slot, unsigned view, uint32_t draw_view_mask,
                     uint64_t *mesh_out, uint64_t *table_out)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
@@ -9643,6 +9712,7 @@ bc250_idx_task_pass(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pip
       .xyz = table, .payload = pool + 256, .application_draw_id = draw_id,
       .application_constants = application_constants,
       .input = dims, .input_count = draws, .compute_args = payload,
+      .task_slot = task_slot,
       .split_piece = view, /* ViewIndex of the pass (radv_bc250_idx_build_task_cs) */
    };
    if (!shared)
@@ -9748,7 +9818,7 @@ bc250_task_idx_consume(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
                                          RADV_CMD_FLAG_INV_SCACHE;
          uint64_t mesh, table;
          if (!bc250_idx_task_pass(cmd_buffer, pipeline, rec, max_count, count, cc->payload,
-                                  cc->application_constants, cc->application_draw_id, pass & 1,
+                                  cc->application_constants, cc->task_slot, cc->application_draw_id, pass & 1,
                                   view, draw_view_mask, &mesh, &table)) {
             if (regions) {
                vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
