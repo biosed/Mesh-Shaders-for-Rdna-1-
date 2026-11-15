@@ -126,6 +126,22 @@ struct radv_sqtt_shaders_reloc {
    uint64_t va[MESA_VULKAN_SHADER_STAGES];
 };
 
+#define RADV_BC250_PIPELINE_TASK_TAIL_CACHE_SIZE 4
+struct radv_cmd_stream;
+struct radv_bc250_task_tail_entry {
+   uint64_t pipeline_id;
+   uint64_t scratch_va;
+   uint32_t view_mask;
+   uint8_t opt_ready;
+   bool recording;
+   uint32_t last_use;
+   uint32_t used_epoch;
+   struct radv_cmd_stream *stream;
+   struct radeon_winsys_bo *const_bo;
+   /* Producer, graphics consumer, fragment, index setup and index pass. */
+   struct radv_shader *shaders[5];
+};
+
 struct radv_graphics_pipeline {
    struct radv_pipeline base;
 
@@ -143,6 +159,10 @@ struct radv_graphics_pipeline {
    bool bc250_shared_setup; /* Setup pipeline and layout owned by the device meta cache. */
    VkPipelineLayout bc250_task_layout;
    uint64_t bc250_tail_id;
+   /* Read-only finalized child streams shared by recordings which use the
+    * device-wide Task scratch. Four entries cover optimized/unoptimized and
+    * ordinary/stereo variants; other variants use the bounded local path. */
+   struct radv_bc250_task_tail_entry bc250_task_tail_cache[RADV_BC250_PIPELINE_TASK_TAIL_CACHE_SIZE];
    /* RADV_BC250_MESH_IDXPASS: index-pass compute pipeline (+ its layout) and the indexed-draw pipeline. */
    VkPipeline bc250_idx_cs;
    VkPipeline bc250_idx_gfx;

@@ -42,17 +42,30 @@ radv_bc250_task_idx_shared_eligible(bool task_persist, bool primary, bool idx_de
 {
    return task_persist && primary && !idx_debug && queue_count == 1 && protected_queue_count == 0;
 }
-#define RADV_BC250_TASK_TAIL_MIN_CONST_SIZE (768u * 1024u)
-static inline uint64_t
-radv_bc250_task_tail_const_size(unsigned indirect_slots)
+static inline bool
+radv_bc250_shared_task_scratch_eligible(bool task_persist, bool primary, bool simultaneous,
+                                        bool dgc, bool chain, unsigned queue_count,
+                                        unsigned protected_queue_count, uint64_t required,
+                                        uint64_t capacity)
 {
-   uint64_t bytes = (uint64_t)indirect_slots * 8192u;
-   if (bytes < RADV_BC250_TASK_TAIL_MIN_CONST_SIZE)
-      bytes = RADV_BC250_TASK_TAIL_MIN_CONST_SIZE;
+   return required <= capacity &&
+          radv_bc250_task_idx_shared_eligible(task_persist,
+                                              primary && !simultaneous && !dgc && !chain,
+                                              false, queue_count, protected_queue_count);
+}
+static inline uint64_t
+radv_bc250_task_tail_const_size(bool task_idx, unsigned passes, unsigned views,
+                                unsigned indirect_slots)
+{
+   views = MAX2(views, 1);
+   const uint64_t per_slot = task_idx ? (uint64_t)views * (256u + (uint64_t)passes * 512u) : 256u;
+   uint64_t bytes = MAX2((uint64_t)indirect_slots * per_slot, 4096u);
    return (bytes + 4095u) & ~4095ull;
 }
 void radv_bc250_task_tails_free(struct radv_cmd_buffer *cmd_buffer);
 void radv_bc250_task_storage_reset(struct radv_cmd_buffer *cmd_buffer, bool destroy);
+void radv_bc250_pipeline_tails_finish(struct radv_device *device,
+                                      struct radv_graphics_pipeline *pipeline);
 /* RADV_BC250_TASK_TAIL in DGC: the slots after the first start this far into the 1 MiB program. */
 #define BC250_DGC_TAIL_OFFSET 65536u
 #define BC250_DGC_TAIL_BYTES (1048576u - BC250_DGC_TAIL_OFFSET)

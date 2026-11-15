@@ -7388,17 +7388,20 @@ radv_upload_graphics_shader_descriptors(struct radv_cmd_buffer *cmd_buffer)
       radv_get_descriptors_state(cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS);
    const VkShaderStageFlags stages = VK_SHADER_STAGE_ALL_GRAPHICS;
 
-   if (cmd_buffer->state.dirty & RADV_CMD_DIRTY_VERTEX_BUFFER) {
-      radv_flush_vertex_descriptors(cmd_buffer);
-      cmd_buffer->state.dirty &= ~RADV_CMD_DIRTY_VERTEX_BUFFER;
-   }
-
-   if (cmd_buffer->state.dirty & RADV_CMD_DIRTY_STREAMOUT_BUFFER) {
-      radv_flush_streamout_descriptors(cmd_buffer);
-      cmd_buffer->state.dirty &= ~RADV_CMD_DIRTY_STREAMOUT_BUFFER;
-   }
-
    if (!cmd_buffer->bc250_inherit_descriptors) {
+      /* A reusable BC250 tail inherits chunk 0's live vertex/streamout
+       * descriptors. Do not bake the first recording's uploads into it or
+       * clear dirty bits which the main stream still needs. */
+      if (cmd_buffer->state.dirty & RADV_CMD_DIRTY_VERTEX_BUFFER) {
+         radv_flush_vertex_descriptors(cmd_buffer);
+         cmd_buffer->state.dirty &= ~RADV_CMD_DIRTY_VERTEX_BUFFER;
+      }
+
+      if (cmd_buffer->state.dirty & RADV_CMD_DIRTY_STREAMOUT_BUFFER) {
+         radv_flush_streamout_descriptors(cmd_buffer);
+         cmd_buffer->state.dirty &= ~RADV_CMD_DIRTY_STREAMOUT_BUFFER;
+      }
+
       if (descriptors_state->dirty) {
          radv_flush_descriptors(cmd_buffer, stages, VK_PIPELINE_BIND_POINT_GRAPHICS);
          descriptors_state->dirty = 0;

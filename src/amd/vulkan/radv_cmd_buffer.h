@@ -504,19 +504,6 @@ struct radv_cmd_buffer_upload {
 
 #define RADV_BC250_TASK_TAIL_CACHE_SIZE 16
 
-struct radv_bc250_task_tail_entry {
-   uint64_t pipeline_id;
-   uint64_t scratch_va;
-   uint32_t view_mask;
-   uint8_t opt_ready;
-   uint32_t last_use;
-   uint32_t used_epoch;
-   struct radv_cmd_stream *stream;
-   struct radeon_winsys_bo *const_bo;
-   /* Producer, graphics consumer, fragment, index setup and index pass. */
-   struct radv_shader *shaders[5];
-};
-
 struct radv_cmd_stream {
    struct ac_cmdbuf *b;
 
@@ -659,13 +646,16 @@ struct radv_cmd_buffer {
    uint64_t bc250_task_scratch_next_size;
    bool bc250_task_scratch_cleared;
    bool bc250_task_scratch_used;
+   bool bc250_shared_task_scratch_used;
    bool bc250_task_app_consts_valid;
+   bool bc250_task_desc_sets_valid;
    bool bc250_inherit_descriptors;
    /* Stable table of the current graphics descriptor-set VAs. Cached Task
     * tails reload each compute shader's own SGPR layout from it. */
    uint64_t bc250_inherit_desc_va;
    uint8_t bc250_fixed_upload;
    uint8_t bc250_task_app_consts[MAX_PUSH_CONSTANTS_SIZE];
+   uint32_t bc250_task_desc_sets[MAX_SETS];
    struct util_dynarray bc250_task_tail_pool;
    uint32_t bc250_task_tail_pool_used;
    uint32_t bc250_task_tail_clock;

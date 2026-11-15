@@ -1627,7 +1627,6 @@ radv_destroy_device(struct radv_device *device, const VkAllocationCallbacks *pAl
       device->bc250_prof_file = NULL;
    }
    radv_bc250_timer_finish(device);
-   radv_bc250_idx_device_finish(device);
    if (device->bc250_async)
       util_queue_destroy(&device->bc250_async_queue);
    radv_device_finish_utrace(device);
@@ -1666,6 +1665,9 @@ radv_destroy_device(struct radv_device *device, const VkAllocationCallbacks *pAl
    _mesa_hash_table_destroy(device->rt_handles, NULL);
 
    radv_device_finish_meta(device);
+   /* Graphics-pipeline teardown can free BC250 pipeline-owned tails and must
+    * retain the tail-cache mutex until every internal meta pipeline is gone. */
+   radv_bc250_idx_device_finish(device);
    radv_device_finish_tools(device);
    radv_device_finish_memory_cache(device);
 

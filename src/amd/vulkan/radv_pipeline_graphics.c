@@ -4163,6 +4163,7 @@ radv_bc250_fit_reset(struct radv_device *device, struct radv_graphics_pipeline *
                      VkShaderStageFlags active_stages, bool reclaim, unsigned min_pieces)
 {
    /* Undo the refused attempt's pipeline state (radv_bc250_prepare_task). */
+   radv_bc250_pipeline_tails_finish(device, pipeline);
    VkDevice _device = radv_device_to_handle(device);
    if (pipeline->bc250_task_pipeline)
       radv_DestroyPipeline(_device, pipeline->bc250_task_pipeline, NULL);
@@ -4448,6 +4449,7 @@ radv_destroy_graphics_pipeline(struct radv_device *device, struct radv_graphics_
          }
       }
    }
+   radv_bc250_pipeline_tails_finish(device, pipeline);
    if (pipeline->bc250_task_pipeline)
       radv_DestroyPipeline(radv_device_to_handle(device), pipeline->bc250_task_pipeline, NULL);
    if (pipeline->bc250_idx_cs)

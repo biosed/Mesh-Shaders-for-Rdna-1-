@@ -75,10 +75,34 @@ TEST(radv_bc250_task_idx, shared_storage_requires_one_unprotected_queue)
 
 TEST(radv_bc250_task_tail, constant_storage_scales_with_indirect_slots)
 {
-   EXPECT_EQ(radv_bc250_task_tail_const_size(1), 768u * 1024u);
-   EXPECT_EQ(radv_bc250_task_tail_const_size(96), 768u * 1024u);
-   EXPECT_EQ(radv_bc250_task_tail_const_size(256), 2u * 1024u * 1024u);
-   EXPECT_EQ(radv_bc250_task_tail_const_size(1024), 8u * 1024u * 1024u);
+   EXPECT_EQ(radv_bc250_task_tail_const_size(false, 0, 0, 1), 4096u);
+   EXPECT_EQ(radv_bc250_task_tail_const_size(false, 0, 1, 1024), 256u * 1024u);
+   EXPECT_EQ(radv_bc250_task_tail_const_size(true, 16, 1, 96), 792u * 1024u);
+   EXPECT_EQ(radv_bc250_task_tail_const_size(true, 16, 1, 1024), 8448u * 1024u);
+   EXPECT_EQ(radv_bc250_task_tail_const_size(true, 4, 2, 8), 36u * 1024u);
+}
+
+TEST(radv_bc250_task_tail, shared_scratch_requires_serial_native_queue)
+{
+   constexpr uint64_t capacity = 36ull << 20;
+   EXPECT_TRUE(radv_bc250_shared_task_scratch_eligible(true, true, false, false, false, 1, 0,
+                                                       capacity, capacity));
+   EXPECT_FALSE(radv_bc250_shared_task_scratch_eligible(false, true, false, false, false, 1, 0,
+                                                        1, capacity));
+   EXPECT_FALSE(radv_bc250_shared_task_scratch_eligible(true, false, false, false, false, 1, 0,
+                                                        1, capacity));
+   EXPECT_FALSE(radv_bc250_shared_task_scratch_eligible(true, true, true, false, false, 1, 0,
+                                                        1, capacity));
+   EXPECT_FALSE(radv_bc250_shared_task_scratch_eligible(true, true, false, true, false, 1, 0,
+                                                        1, capacity));
+   EXPECT_FALSE(radv_bc250_shared_task_scratch_eligible(true, true, false, false, true, 1, 0,
+                                                        1, capacity));
+   EXPECT_FALSE(radv_bc250_shared_task_scratch_eligible(true, true, false, false, false, 2, 0,
+                                                        1, capacity));
+   EXPECT_FALSE(radv_bc250_shared_task_scratch_eligible(true, true, false, false, false, 1, 1,
+                                                        1, capacity));
+   EXPECT_FALSE(radv_bc250_shared_task_scratch_eligible(true, true, false, false, false, 1, 0,
+                                                        capacity + 1, capacity));
 }
 
 TEST_F(radv_bc250_dispatch_test, row_major_32bit)

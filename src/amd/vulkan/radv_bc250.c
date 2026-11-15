@@ -64,6 +64,7 @@ radv_bc250_device_env_init(struct radv_device *device, const struct radv_physica
    struct radv_bc250_device_env *env = &device->bc250_env;
    simple_mtx_init(&device->bc250_idx_spare_mtx, mtx_plain);
    simple_mtx_init(&device->bc250_task_idx_shared_mtx, mtx_plain);
+   simple_mtx_init(&device->bc250_task_tail_cache_mtx, mtx_plain);
    env->pipeline_plan = pdev->bc250_native_mesh && !pdev->bc250_native_task &&
       pdev->info.family == CHIP_GFX1013 && debug_get_bool_option("RADV_BC250_PIPELINE_PLAN", false);
    env->gpl_source_link = env->pipeline_plan && debug_get_bool_option("RADV_BC250_GPL_SOURCE_LINK", false);
@@ -6780,6 +6781,7 @@ radv_bc250_task_tails_free(struct radv_cmd_buffer *cmd_buffer)
 #define BC250_PERSIST_DESC_BYTES      (MAX_SETS * (unsigned)sizeof(uint32_t))
 #define BC250_PERSIST_PAYLOAD_OFFSET  ALIGN_POT(BC250_PERSIST_DESC_OFFSET + BC250_PERSIST_DESC_BYTES, 256u)
 #define BC250_PERSIST_MIN_SCRATCH     (12ull << 20)
+#define BC250_SHARED_TASK_SCRATCH_SIZE (36ull << 20)
 
 static void
 bc250_task_tail_entry_clear(struct radv_device *device, struct vk_object_base *owner,
@@ -6788,7 +6790,8 @@ bc250_task_tail_entry_clear(struct radv_device *device, struct vk_object_base *o
    if (entry->stream)
       radv_destroy_cmd_stream(device, entry->stream);
    if (entry->const_bo) {
-      radv_rmv_log_command_buffer_bo_destroy(device, entry->const_bo);
+      if (owner != &device->vk.base)
+         radv_rmv_log_command_buffer_bo_destroy(device, entry->const_bo);
       radv_bo_destroy(device, owner, entry->const_bo);
    }
    for (unsigned s = 0; s < ARRAY_SIZE(entry->shaders); s++) {
@@ -6796,6 +6799,21 @@ bc250_task_tail_entry_clear(struct radv_device *device, struct vk_object_base *o
          radv_shader_unref(device, entry->shaders[s]);
    }
    memset(entry, 0, sizeof(*entry));
+}
+
+void
+radv_bc250_pipeline_tails_finish(struct radv_device *device,
+                                 struct radv_graphics_pipeline *pipeline)
+{
+   simple_mtx_lock(&device->bc250_task_tail_cache_mtx);
+   for (unsigned i = 0; i < ARRAY_SIZE(pipeline->bc250_task_tail_cache); i++) {
+      struct radv_bc250_task_tail_entry *entry = &pipeline->bc250_task_tail_cache[i];
+      /* Pipeline creation/recording/destruction are externally synchronized
+       * by Vulkan. A live reservation here would indicate an invalid caller. */
+      assert(!entry->recording);
+      bc250_task_tail_entry_clear(device, &device->vk.base, entry);
+   }
+   simple_mtx_unlock(&device->bc250_task_tail_cache_mtx);
 }
 
 static VkResult
@@ -6825,8 +6843,67 @@ bc250_create_persist_task_scratch(struct radv_cmd_buffer *cmd_buffer, uint64_t a
    cmd_buffer->bc250_task_scratch_bo = bo;
    cmd_buffer->bc250_task_scratch_size = alloc_size;
    cmd_buffer->bc250_task_scratch_cleared = false;
+   cmd_buffer->bc250_task_desc_sets_valid = false;
    radv_rmv_log_command_buffer_bo_create(device, bo, 0, alloc_size, 0);
    return VK_SUCCESS;
+}
+
+static bool
+bc250_alloc_shared_task_scratch(struct radv_cmd_buffer *cmd_buffer, uint64_t required,
+                                uint64_t *address)
+{
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   if (!radv_bc250_shared_task_scratch_eligible(
+          device->bc250_env.task_persist,
+          cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+          cmd_buffer->usage_flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT,
+          cmd_buffer->bc250_dgc_upload_va != 0, radv_bc250_chain_enabled(device),
+          device->queue_count[cmd_buffer->qf], device->queue_count_protected[cmd_buffer->qf],
+          required, BC250_SHARED_TASK_SCRATCH_SIZE))
+      return false;
+
+   simple_mtx_lock(&device->bc250_task_idx_shared_mtx);
+   if (!device->bc250_shared_task_scratch_bo &&
+       !device->bc250_shared_task_scratch_failed) {
+      const bool gtt = radv_device_physical(device)->info.family == CHIP_GFX1013;
+      const enum radeon_bo_domain domain = gtt ? RADEON_DOMAIN_GTT : RADEON_DOMAIN_VRAM;
+      const enum radeon_bo_flag flags =
+         RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_NO_CPU_ACCESS |
+         RADEON_FLAG_32BIT | (device->bc250_env.local_bos ? RADEON_FLAG_PREFER_LOCAL_BO : 0) |
+         (gtt ? RADEON_FLAG_GTT_WC : RADEON_FLAG_ZERO_VRAM);
+      struct radeon_winsys_bo *bo = NULL;
+      if (radv_bo_create(device, &device->vk.base, BC250_SHARED_TASK_SCRATCH_SIZE,
+                         4096, domain, flags, RADV_BO_PRIORITY_SCRATCH, 0, true,
+                         &bo) != VK_SUCCESS) {
+         device->bc250_shared_task_scratch_failed = true;
+      } else {
+         device->bc250_shared_task_scratch_bo = bo;
+         device->bc250_shared_task_scratch_va = radv_buffer_get_va(bo);
+      }
+   }
+   struct radeon_winsys_bo *bo = device->bc250_shared_task_scratch_bo;
+   const uint64_t va = device->bc250_shared_task_scratch_va;
+   simple_mtx_unlock(&device->bc250_task_idx_shared_mtx);
+   if (!bo)
+      return false;
+
+   if (!cmd_buffer->bc250_shared_task_scratch_used) {
+      /* Another recording may have overwritten the shared descriptor table
+       * since this command buffer last used it. Its first draw must publish
+       * the complete current table again. */
+      cmd_buffer->bc250_task_desc_sets_valid = false;
+      radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, bo);
+      cmd_buffer->state.flush_bits |=
+         RADV_CMD_FLAG_VS_PARTIAL_FLUSH | RADV_CMD_FLAG_PS_PARTIAL_FLUSH |
+         RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_WB_L2 |
+         RADV_CMD_FLAG_INV_VCACHE | RADV_CMD_FLAG_INV_SCACHE |
+         RADV_CMD_FLAG_INV_L2;
+      radv_emit_cache_flush(cmd_buffer);
+      ac_emit_cp_pfp_sync_me(cmd_buffer->cs->b, false);
+      cmd_buffer->bc250_shared_task_scratch_used = true;
+   }
+   *address = va;
+   return true;
 }
 
 void
@@ -6852,14 +6929,18 @@ radv_bc250_task_storage_reset(struct radv_cmd_buffer *cmd_buffer, bool destroy)
       cmd_buffer->bc250_task_scratch_next_size = 0;
       cmd_buffer->bc250_task_scratch_cleared = false;
       cmd_buffer->bc250_task_scratch_used = false;
+      cmd_buffer->bc250_shared_task_scratch_used = false;
       cmd_buffer->bc250_task_app_consts_valid = false;
+      cmd_buffer->bc250_task_desc_sets_valid = false;
       return;
    }
    for (unsigned i = 0; i < cmd_buffer->bc250_task_tail_pool_used; i++)
       radv_reset_cmd_stream(device, pool[i]);
    cmd_buffer->bc250_task_tail_pool_used = 0;
    cmd_buffer->bc250_task_scratch_used = false;
+   cmd_buffer->bc250_shared_task_scratch_used = false;
    cmd_buffer->bc250_task_app_consts_valid = false;
+   cmd_buffer->bc250_task_desc_sets_valid = false;
    if (cmd_buffer->bc250_task_scratch_next_size > cmd_buffer->bc250_task_scratch_size) {
       const uint64_t grow = cmd_buffer->bc250_task_scratch_next_size;
       cmd_buffer->bc250_task_scratch_next_size = 0;
@@ -6886,6 +6967,8 @@ bc250_alloc_persist_task_scratch(struct radv_cmd_buffer *cmd_buffer,
    const uint64_t required = (uint64_t)BC250_PERSIST_PAYLOAD_OFFSET +
                              (uint64_t)count * pipeline->bc250_payload_stride;
    const uint64_t alloc_size = MAX2(ALIGN_POT(required, 4096ull), BC250_PERSIST_MIN_SCRATCH);
+   if (bc250_alloc_shared_task_scratch(cmd_buffer, required, address))
+      return true;
    if (!cmd_buffer->bc250_task_scratch_bo) {
       if (bc250_create_persist_task_scratch(cmd_buffer, alloc_size) != VK_SUCCESS)
          return false;
@@ -6934,7 +7017,12 @@ bc250_emit_task_descriptor_table(struct radv_cmd_buffer *cmd_buffer, uint64_t va
       const uint64_t set_va = descriptor ? descriptor->header.va : descriptors->descriptor_buffers[set];
       sets[set] = (uint32_t)set_va;
    }
+   if (cmd_buffer->bc250_task_desc_sets_valid &&
+       memcmp(cmd_buffer->bc250_task_desc_sets, sets, sizeof(sets)) == 0)
+      return;
    bc250_emit_task_write_data(cmd_buffer, va, sets, sizeof(sets));
+   memcpy(cmd_buffer->bc250_task_desc_sets, sets, sizeof(sets));
+   cmd_buffer->bc250_task_desc_sets_valid = true;
 }
 
 static bool
@@ -6954,9 +7042,10 @@ bc250_can_cache_task_tail(const struct radv_cmd_buffer *cmd_buffer,
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    if (!device->bc250_env.task_persist || dgc || cmd_buffer->bc250_dgc_upload_va ||
        cmd_buffer->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY ||
-       pipeline->base.type != RADV_PIPELINE_GRAPHICS || !pipeline->bc250_tail_id)
+       pipeline->base.type != RADV_PIPELINE_GRAPHICS || !pipeline->bc250_tail_id ||
+       cmd_buffer->state.cond_render.enabled)
       return false;
-   if (pipeline->bc250_task_idx && !device->bc250_task_idx_shared_bo)
+   if (pipeline->bc250_task_idx && !cmd_buffer->bc250_task_idx_shared_used)
       return false;
    VK_FROM_HANDLE(radv_pipeline, task_base, pipeline->bc250_task_pipeline);
    VK_FROM_HANDLE(radv_pipeline, idx_setup_base, pipeline->bc250_idx_setup);
@@ -7009,6 +7098,16 @@ bc250_acquire_pooled_task_tail(struct radv_cmd_buffer *cmd_buffer)
    return tail;
 }
 
+static void
+bc250_release_pipeline_tail_reservation(struct radv_device *device,
+                                        struct radv_bc250_task_tail_entry *entry)
+{
+   simple_mtx_lock(&device->bc250_task_tail_cache_mtx);
+   assert(entry->recording && !entry->stream && !entry->const_bo);
+   memset(entry, 0, sizeof(*entry));
+   simple_mtx_unlock(&device->bc250_task_tail_cache_mtx);
+}
+
 /* RADV_BC250_TASK_TAIL: record chunk slots 1..BC250_INDIRECT_CHUNKS-1 once into a side
  * stream. The commands are the ones the inline loop emits; the side stream has its own
  * register tracking, so it re-emits every tracked register it uses. Every record of one
@@ -7029,36 +7128,79 @@ bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
    const uint8_t opt_ready = (uint8_t)!!__atomic_load_n(&pipeline->bc250_opt_ready, __ATOMIC_ACQUIRE);
    const uint32_t view_mask = cmd_buffer->state.render.view_mask;
    struct radv_bc250_task_tail_entry *cache_slot = NULL;
+   struct vk_object_base *cache_owner = &cmd_buffer->vk.base;
    struct radeon_winsys_bo *const_bo = NULL;
    uint8_t *const_map = NULL;
-   const uint64_t const_size = radv_bc250_task_tail_const_size(indirect_slots);
+   const uint64_t const_size =
+      radv_bc250_task_tail_const_size(pipeline->bc250_task_idx,
+                                      pipeline->bc250_task_idx ? pipeline->bc250_task_idx_passes : 0,
+                                      util_bitcount(view_mask), indirect_slots);
    bool from_pool = false;
+   bool pipeline_cache = false;
 
    if (bc250_can_cache_task_tail(cmd_buffer, pipeline, dgc)) {
-      const uint32_t epoch = cmd_buffer->bc250_task_reset_seq ? cmd_buffer->bc250_task_reset_seq : 1u;
-      for (unsigned i = 0; i < ARRAY_SIZE(cmd_buffer->bc250_task_tail_cache); i++) {
-         struct radv_bc250_task_tail_entry *e = &cmd_buffer->bc250_task_tail_cache[i];
-         if (e->stream && e->pipeline_id == pipeline->bc250_tail_id && e->scratch_va == address &&
-             e->view_mask == view_mask && e->opt_ready == opt_ready) {
-            e->last_use = ++cmd_buffer->bc250_task_tail_clock;
-            e->used_epoch = epoch;
-            return e->stream;
+      const bool shared_scratch =
+         device->bc250_shared_task_scratch_bo && address == device->bc250_shared_task_scratch_va;
+      if (shared_scratch) {
+         struct radv_cmd_stream *cached = NULL;
+         bool matching_recording = false;
+         simple_mtx_lock(&device->bc250_task_tail_cache_mtx);
+         for (unsigned i = 0; i < ARRAY_SIZE(pipeline->bc250_task_tail_cache); i++) {
+            struct radv_bc250_task_tail_entry *e = &pipeline->bc250_task_tail_cache[i];
+            if (!e->recording && e->stream && e->pipeline_id == pipeline->bc250_tail_id &&
+                e->scratch_va == address && e->view_mask == view_mask && e->opt_ready == opt_ready) {
+               cached = e->stream;
+               break;
+            }
+            if (e->recording && e->pipeline_id == pipeline->bc250_tail_id &&
+                e->scratch_va == address && e->view_mask == view_mask && e->opt_ready == opt_ready)
+               matching_recording = true;
          }
-      }
-      for (unsigned i = 0; i < ARRAY_SIZE(cmd_buffer->bc250_task_tail_cache); i++) {
-         struct radv_bc250_task_tail_entry *e = &cmd_buffer->bc250_task_tail_cache[i];
-         if (!e->stream) {
-            cache_slot = e;
-            break;
+         if (!cached && !matching_recording) {
+            for (unsigned i = 0; i < ARRAY_SIZE(pipeline->bc250_task_tail_cache); i++) {
+               struct radv_bc250_task_tail_entry *e = &pipeline->bc250_task_tail_cache[i];
+               if (!e->recording && !e->stream) {
+                  cache_slot = e;
+                  e->pipeline_id = pipeline->bc250_tail_id;
+                  e->scratch_va = address;
+                  e->view_mask = view_mask;
+                  e->opt_ready = opt_ready;
+                  e->recording = true;
+                  pipeline_cache = true;
+                  cache_owner = &device->vk.base;
+                  break;
+               }
+            }
          }
-      }
-      if (!cache_slot) {
+         simple_mtx_unlock(&device->bc250_task_tail_cache_mtx);
+         if (cached)
+            return cached;
+      } else {
+         const uint32_t epoch = cmd_buffer->bc250_task_reset_seq ? cmd_buffer->bc250_task_reset_seq : 1u;
          for (unsigned i = 0; i < ARRAY_SIZE(cmd_buffer->bc250_task_tail_cache); i++) {
             struct radv_bc250_task_tail_entry *e = &cmd_buffer->bc250_task_tail_cache[i];
-            if (e->used_epoch == epoch)
-               continue;
-            if (!cache_slot || (int32_t)(e->last_use - cache_slot->last_use) < 0)
+            if (e->stream && e->pipeline_id == pipeline->bc250_tail_id && e->scratch_va == address &&
+                e->view_mask == view_mask && e->opt_ready == opt_ready) {
+               e->last_use = ++cmd_buffer->bc250_task_tail_clock;
+               e->used_epoch = epoch;
+               return e->stream;
+            }
+         }
+         for (unsigned i = 0; i < ARRAY_SIZE(cmd_buffer->bc250_task_tail_cache); i++) {
+            struct radv_bc250_task_tail_entry *e = &cmd_buffer->bc250_task_tail_cache[i];
+            if (!e->stream) {
                cache_slot = e;
+               break;
+            }
+         }
+         if (!cache_slot) {
+            for (unsigned i = 0; i < ARRAY_SIZE(cmd_buffer->bc250_task_tail_cache); i++) {
+               struct radv_bc250_task_tail_entry *e = &cmd_buffer->bc250_task_tail_cache[i];
+               if (e->used_epoch == epoch)
+                  continue;
+               if (!cache_slot || (int32_t)(e->last_use - cache_slot->last_use) < 0)
+                  cache_slot = e;
+            }
          }
       }
       if (cache_slot) {
@@ -7066,17 +7208,23 @@ bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
             RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING |
             RADEON_FLAG_32BIT | RADEON_FLAG_GTT_WC |
             (device->bc250_env.local_bos ? RADEON_FLAG_PREFER_LOCAL_BO : 0);
-         if (radv_bo_create(device, &cmd_buffer->vk.base, const_size, 4096,
+         if (radv_bo_create(device, cache_owner, const_size, 4096,
                             device->ws->cs_domain(device->ws), cflags,
                             RADV_BO_PRIORITY_UPLOAD_BUFFER, 0, true, &const_bo) == VK_SUCCESS) {
             const_map = radv_buffer_map(device->ws, const_bo);
             if (!const_map) {
-               radv_bo_destroy(device, &cmd_buffer->vk.base, const_bo);
+               radv_bo_destroy(device, cache_owner, const_bo);
                const_bo = NULL;
+               if (pipeline_cache)
+                  bc250_release_pipeline_tail_reservation(device, cache_slot);
                cache_slot = NULL;
+               pipeline_cache = false;
             }
          } else {
+            if (pipeline_cache)
+               bc250_release_pipeline_tail_reservation(device, cache_slot);
             cache_slot = NULL;
+            pipeline_cache = false;
          }
       }
    }
@@ -7090,7 +7238,9 @@ bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
    } else {
       if (radv_create_cmd_stream(device, AMD_IP_GFX, !dgc, &tail) != VK_SUCCESS) {
          if (const_bo)
-            radv_bo_destroy(device, &cmd_buffer->vk.base, const_bo);
+            radv_bo_destroy(device, cache_owner, const_bo);
+         if (pipeline_cache)
+            bc250_release_pipeline_tail_reservation(device, cache_slot);
          return NULL;
       }
    }
@@ -7203,11 +7353,12 @@ bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
          radv_destroy_cmd_stream(device, tail);
       }
       if (const_bo)
-         radv_bo_destroy(device, &cmd_buffer->vk.base, const_bo);
+         radv_bo_destroy(device, cache_owner, const_bo);
+      if (pipeline_cache)
+         bc250_release_pipeline_tail_reservation(device, cache_slot);
       return NULL;
    }
    if (cache_slot) {
-      bc250_task_tail_entry_clear(device, &cmd_buffer->vk.base, cache_slot);
       VK_FROM_HANDLE(radv_pipeline, task_pipe_base, pipeline->bc250_task_pipeline);
       VK_FROM_HANDLE(radv_pipeline, idx_setup_base, pipeline->bc250_idx_setup);
       VK_FROM_HANDLE(radv_pipeline, idx_pass_base, pipeline->bc250_idx_cs_ind);
@@ -7217,12 +7368,12 @@ bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
       struct radv_shader *frag_s = cmd_buffer->state.shaders[MESA_SHADER_FRAGMENT];
       struct radv_shader *idx_setup_s = idx_setup_base ? idx_setup_base->shaders[MESA_SHADER_COMPUTE] : NULL;
       struct radv_shader *idx_pass_s = idx_pass_base ? idx_pass_base->shaders[MESA_SHADER_COMPUTE] : NULL;
+      if (!pipeline_cache)
+         bc250_task_tail_entry_clear(device, &cmd_buffer->vk.base, cache_slot);
       cache_slot->pipeline_id = pipeline->bc250_tail_id;
       cache_slot->scratch_va = address;
       cache_slot->view_mask = view_mask;
       cache_slot->opt_ready = opt_ready;
-      cache_slot->last_use = ++cmd_buffer->bc250_task_tail_clock;
-      cache_slot->used_epoch = cmd_buffer->bc250_task_reset_seq ? cmd_buffer->bc250_task_reset_seq : 1u;
       cache_slot->stream = tail;
       cache_slot->const_bo = const_bo;
       cache_slot->shaders[0] = prod_s ? radv_shader_ref(prod_s) : NULL;
@@ -7230,7 +7381,16 @@ bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
       cache_slot->shaders[2] = frag_s ? radv_shader_ref(frag_s) : NULL;
       cache_slot->shaders[3] = idx_setup_s ? radv_shader_ref(idx_setup_s) : NULL;
       cache_slot->shaders[4] = idx_pass_s ? radv_shader_ref(idx_pass_s) : NULL;
-      radv_rmv_log_command_buffer_bo_create(device, const_bo, 0, const_size, 0);
+      if (pipeline_cache) {
+         simple_mtx_lock(&device->bc250_task_tail_cache_mtx);
+         cache_slot->recording = false;
+         simple_mtx_unlock(&device->bc250_task_tail_cache_mtx);
+      } else {
+         cache_slot->last_use = ++cmd_buffer->bc250_task_tail_clock;
+         cache_slot->used_epoch = cmd_buffer->bc250_task_reset_seq ? cmd_buffer->bc250_task_reset_seq : 1u;
+      }
+      if (!pipeline_cache)
+         radv_rmv_log_command_buffer_bo_create(device, const_bo, 0, const_size, 0);
       return tail;
    }
    if (!dgc && !from_pool)
@@ -7329,7 +7489,8 @@ bc250_draw_task(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint
       slots_base = BC250_PERSIST_SLOT_OFFSET;
       args_offset = BC250_PERSIST_ARGS_OFFSET;
       bytes = BC250_PERSIST_PAYLOAD_OFFSET + payload_bytes;
-      const bool already_cleared = cmd_buffer->bc250_task_scratch_cleared;
+      const bool shared_scratch = address == radv_cmd_buffer_device(cmd_buffer)->bc250_shared_task_scratch_va;
+      const bool already_cleared = shared_scratch || cmd_buffer->bc250_task_scratch_cleared;
       if (already_cleared || !(cmd_buffer->usage_flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)) {
          cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_VS_PARTIAL_FLUSH | RADV_CMD_FLAG_PS_PARTIAL_FLUSH |
                                          RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_VCACHE |
@@ -7415,7 +7576,9 @@ bc250_draw_task(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint
    compute_descriptors->dirty |= compute_descriptors->valid;
    compute_descriptors->dirty_dynamic = true;
    compute_descriptors->dirty_heaps |= compute_descriptors->valid_heaps;
-   if (persist_scratch)
+   /* Only cached indirect tails reload descriptors from this table. Direct
+    * draws bind their live descriptors conventionally and need no CP write. */
+   if (persist_scratch && indirect_va)
       bc250_emit_task_descriptor_table(cmd_buffer, address + BC250_PERSIST_DESC_OFFSET);
 
    if (indirect_va) {
@@ -8835,11 +8998,17 @@ bc250_idx_spare_take(struct radv_device *device, uint32_t min_size, uint32_t max
 void
 radv_bc250_idx_device_finish(struct radv_device *device)
 {
+   if (device->bc250_shared_task_scratch_bo) {
+      radv_bo_destroy(device, &device->vk.base,
+                      device->bc250_shared_task_scratch_bo);
+      device->bc250_shared_task_scratch_bo = NULL;
+   }
    if (device->bc250_task_idx_shared_bo) {
       radv_bo_destroy(device, NULL, device->bc250_task_idx_shared_bo);
       p_atomic_add(&device->bc250_idx_storage_bytes, -(int32_t)device->bc250_task_idx_shared_bytes);
       device->bc250_task_idx_shared_bo = NULL;
    }
+   simple_mtx_destroy(&device->bc250_task_tail_cache_mtx);
    simple_mtx_destroy(&device->bc250_task_idx_shared_mtx);
    for (unsigned i = 0; i < device->bc250_idx_spare_count; i++) {
       radv_bo_destroy(device, NULL, device->bc250_idx_spare[i].bo);

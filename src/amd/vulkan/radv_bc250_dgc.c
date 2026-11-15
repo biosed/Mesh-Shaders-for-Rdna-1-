@@ -391,7 +391,9 @@ bc250_dgc_capture(struct radv_cmd_buffer *owner, const struct radv_cmd_buffer *s
    cmd->bc250_task_scratch_next_size = 0;
    cmd->bc250_task_scratch_cleared = false;
    cmd->bc250_task_scratch_used = false;
+   cmd->bc250_shared_task_scratch_used = false;
    cmd->bc250_task_app_consts_valid = false;
+   cmd->bc250_task_desc_sets_valid = false;
    cmd->bc250_inherit_descriptors = false;
    cmd->bc250_inherit_desc_va = 0;
    cmd->bc250_fixed_upload = 0;

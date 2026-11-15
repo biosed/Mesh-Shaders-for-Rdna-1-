@@ -231,6 +231,13 @@ struct radv_device {
    uint32_t bc250_task_idx_shared_pool_capacity;
    uint32_t bc250_task_idx_shared_bytes;
    bool bc250_task_idx_shared_failed;
+   /* Task scratch and cached finalized tails are shared only by one
+    * unprotected native queue. The common mutex protects lazy allocation and
+    * per-pipeline cache publication; GPU drains serialize execution. */
+   struct radeon_winsys_bo *bc250_shared_task_scratch_bo;
+   uint64_t bc250_shared_task_scratch_va;
+   bool bc250_shared_task_scratch_failed;
+   simple_mtx_t bc250_task_tail_cache_mtx;
    struct radv_bc250_device_env bc250_env;
    /* RADV_BC250_ASYNC_COMPILE: background queue for the optimized Mesh/FS binaries of pipelines that were
     * created with an unoptimized ACO build first (radv_pipeline_graphics.c). */
