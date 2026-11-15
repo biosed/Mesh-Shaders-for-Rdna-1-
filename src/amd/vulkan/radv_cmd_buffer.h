@@ -608,6 +608,9 @@ struct radv_cmd_buffer {
    uint64_t bc250_idx_offset;
    struct radeon_winsys_bo *bc250_idx_pool_bo;
    bool bc250_idx_pool_used;
+   /* This recording has made the device-shared Task-index storage resident
+    * and drained older users on its one native queue. */
+   bool bc250_task_idx_shared_used;
    /* RADV_BC250_MESH_TASK_IDX: two table sets, used alternately by consecutive index passes. */
    uint64_t bc250_task_idx_tables[2];
    /* Recording inside an indirect chunk's COND_EXEC region, which reserved its space already. */

@@ -63,6 +63,7 @@ radv_bc250_device_env_init(struct radv_device *device, const struct radv_physica
 {
    struct radv_bc250_device_env *env = &device->bc250_env;
    simple_mtx_init(&device->bc250_idx_spare_mtx, mtx_plain);
+   simple_mtx_init(&device->bc250_task_idx_shared_mtx, mtx_plain);
    env->pipeline_plan = pdev->bc250_native_mesh && !pdev->bc250_native_task &&
       pdev->info.family == CHIP_GFX1013 && debug_get_bool_option("RADV_BC250_PIPELINE_PLAN", false);
    env->gpl_source_link = env->pipeline_plan && debug_get_bool_option("RADV_BC250_GPL_SOURCE_LINK", false);
@@ -6921,8 +6922,9 @@ bc250_can_cache_task_tail(const struct radv_cmd_buffer *cmd_buffer,
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    if (!device->bc250_env.task_persist || dgc || cmd_buffer->bc250_dgc_upload_va ||
        cmd_buffer->vk.level != VK_COMMAND_BUFFER_LEVEL_PRIMARY ||
-       pipeline->base.type != RADV_PIPELINE_GRAPHICS || !pipeline->bc250_tail_id ||
-       pipeline->bc250_task_idx)
+       pipeline->base.type != RADV_PIPELINE_GRAPHICS || !pipeline->bc250_tail_id)
+      return false;
+   if (pipeline->bc250_task_idx && !device->bc250_task_idx_shared_bo)
       return false;
    for (unsigned i = 0; i <= MESA_SHADER_MESH; i++) {
       if (cmd_buffer->state.shader_objs[i])
@@ -6930,8 +6932,10 @@ bc250_can_cache_task_tail(const struct radv_cmd_buffer *cmd_buffer,
    }
    const struct radv_shader *ms = cmd_buffer->state.shaders[MESA_SHADER_MESH];
    const struct radv_shader *fs = cmd_buffer->state.shaders[MESA_SHADER_FRAGMENT];
-   if (!ms || ms->info.ms.bc250_merge_dims ||
-       (!ms->info.bc250_compat_constants && (ms->info.loads_push_constants || ms->info.inline_push_constant_mask)))
+   if (!pipeline->bc250_task_idx &&
+       (!ms || ms->info.ms.bc250_merge_dims ||
+        (!ms->info.bc250_compat_constants &&
+         (ms->info.loads_push_constants || ms->info.inline_push_constant_mask))))
       return false;
    if (fs && (fs->info.ps.has_epilog ||
               (!fs->info.bc250_compat_constants && (fs->info.loads_push_constants || fs->info.inline_push_constant_mask))))
@@ -6972,7 +6976,8 @@ bc250_acquire_pooled_task_tail(struct radv_cmd_buffer *cmd_buffer)
  * every record of the call. Returns NULL when the slots must stay inline. */
 static struct radv_cmd_stream *
 bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline,
-                       const struct bc250_constants *constants, uint64_t address, bool dgc)
+                       const struct bc250_constants *constants, uint64_t address,
+                       unsigned indirect_slots, bool dgc)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radv_cmd_stream *main_cs = cmd_buffer->cs, *tail = NULL;
@@ -7107,7 +7112,7 @@ bc250_record_task_tail(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
       radv_cs_add_buffer(device->ws, tail->b, const_bo);
    }
    cmd_buffer->cs = tail;
-   for (unsigned k = 1; k < BC250_INDIRECT_CHUNKS && cmd_buffer->bc250_fixed_upload != 2 &&
+   for (unsigned k = 1; k < indirect_slots && cmd_buffer->bc250_fixed_upload != 2 &&
                         !vk_command_buffer_has_error(&cmd_buffer->vk); k++)
       bc250_emit_indirect_chunk(cmd_buffer, pipeline, constants, address, k, true);
    /* The tail returns past everything the inline path would still flush. */
@@ -7383,10 +7388,11 @@ bc250_draw_task(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint
        * 1..1023 (primary command buffers only: an IB2 cannot nest). */
       /* The shared slots need the DrawID from memory (compiler_info.bc250x.task_tail). */
       const bool dgc_tail = cmd_buffer->bc250_dgc_tail_va != 0;
-      /* The Task index route records per-draw tables: never inside a tail recorded once. */
-      if (task_tail && skip_suffix && device->compiler_info.bc250x.task_tail && !pipeline->bc250_task_idx &&
+      if (task_tail && skip_suffix && device->compiler_info.bc250x.task_tail &&
+          (!pipeline->bc250_task_idx || !dgc_tail) &&
           (dgc_tail || cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) && !*task_tail)
-         *task_tail = bc250_record_task_tail(cmd_buffer, pipeline, &constants, address, dgc_tail);
+         *task_tail = bc250_record_task_tail(cmd_buffer, pipeline, &constants, address,
+                                             indirect_slots, dgc_tail);
       if (task_tail && *task_tail && dgc_tail) {
          /* DGC: the program already runs as an IB2. One conditional CHAIN to the slots the
           * capture copies to bc250_dgc_tail_va; they end the IB2 like the inline slots did. */
@@ -8760,6 +8766,12 @@ bc250_idx_spare_take(struct radv_device *device, uint32_t min_size, uint32_t max
 void
 radv_bc250_idx_device_finish(struct radv_device *device)
 {
+   if (device->bc250_task_idx_shared_bo) {
+      radv_bo_destroy(device, NULL, device->bc250_task_idx_shared_bo);
+      p_atomic_add(&device->bc250_idx_storage_bytes, -(int32_t)device->bc250_task_idx_shared_bytes);
+      device->bc250_task_idx_shared_bo = NULL;
+   }
+   simple_mtx_destroy(&device->bc250_task_idx_shared_mtx);
    for (unsigned i = 0; i < device->bc250_idx_spare_count; i++) {
       radv_bo_destroy(device, NULL, device->bc250_idx_spare[i].bo);
       p_atomic_add(&device->bc250_idx_storage_bytes, -(int32_t)device->bc250_idx_spare[i].size);
@@ -8904,6 +8916,7 @@ radv_bc250_idx_storage_reset(struct radv_cmd_buffer *cmd_buffer, bool destroy)
    cmd_buffer->bc250_idx_offset = 0;
    cmd_buffer->bc250_idx_added = 0;
    cmd_buffer->bc250_idx_pool_used = false;
+   cmd_buffer->bc250_task_idx_shared_used = false;
    cmd_buffer->bc250_idx_batch_upload_bytes = 0;
    cmd_buffer->bc250_task_idx_tables[0] = cmd_buffer->bc250_task_idx_tables[1] = 0;
 }
@@ -9513,12 +9526,81 @@ bc250_idx_task_table_bytes(uint32_t max_count)
 }
 
 static bool
-bc250_idx_task_pass(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline, uint64_t records,
-                    uint32_t max_count, uint64_t count_va, uint64_t payload, uint32_t draw_id, unsigned slot,
-                    unsigned view, uint32_t draw_view_mask, uint64_t *mesh_out, uint64_t *table_out)
+bc250_task_idx_shared_storage(struct radv_cmd_buffer *cmd_buffer, uint64_t *pool,
+                              uint32_t *capacity, uint64_t tables[2])
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
-   if (!cmd_buffer->bc250_idx_pool_bo) {
+   if (!radv_bc250_task_idx_shared_eligible(
+          device->bc250_env.task_persist,
+          cmd_buffer->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+          device->bc250_env.idx_debug,
+          device->queue_count[cmd_buffer->qf],
+          device->queue_count_protected[cmd_buffer->qf]))
+      return false;
+
+   simple_mtx_lock(&device->bc250_task_idx_shared_mtx);
+   if (!device->bc250_task_idx_shared_bo && !device->bc250_task_idx_shared_failed) {
+      const uint32_t pool_bytes = device->bc250_env.idx_pool_bytes;
+      const uint32_t table_bytes =
+         ALIGN_POT(bc250_idx_task_table_bytes(BC250_TASK_IDX_MAX_CHUNK), 4096);
+      const uint32_t total = pool_bytes + 2 * table_bytes;
+      struct radeon_winsys_bo *bo = NULL;
+      const bool reserved = bc250_idx_reserve(device, total);
+      if (!reserved ||
+          bc250_idx_create_storage(device, total, false, "task-shared", &bo) != VK_SUCCESS) {
+         if (bo)
+            radv_bo_destroy(device, NULL, bo);
+         if (reserved)
+            p_atomic_add(&device->bc250_idx_storage_bytes, -(int32_t)total);
+         device->bc250_task_idx_shared_failed = true;
+      } else {
+         const uint64_t va = radv_buffer_get_va(bo);
+         device->bc250_task_idx_shared_bo = bo;
+         device->bc250_task_idx_shared_pool = va;
+         device->bc250_task_idx_shared_tables[0] = va + pool_bytes;
+         device->bc250_task_idx_shared_tables[1] = va + pool_bytes + table_bytes;
+         device->bc250_task_idx_shared_pool_capacity = (pool_bytes - 256) / 4;
+         device->bc250_task_idx_shared_bytes = total;
+      }
+   }
+   struct radeon_winsys_bo *bo = device->bc250_task_idx_shared_bo;
+   if (bo) {
+      *pool = device->bc250_task_idx_shared_pool;
+      *capacity = device->bc250_task_idx_shared_pool_capacity;
+      tables[0] = device->bc250_task_idx_shared_tables[0];
+      tables[1] = device->bc250_task_idx_shared_tables[1];
+   }
+   simple_mtx_unlock(&device->bc250_task_idx_shared_mtx);
+   if (!bo)
+      return false;
+
+   if (!cmd_buffer->bc250_task_idx_shared_used) {
+      radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, bo);
+      /* Queue order alone does not stop stages of adjacent command buffers
+       * overlapping.  Drain older readers before this recording overwrites
+       * the shared pool or either table set. */
+      cmd_buffer->state.flush_bits |=
+         RADV_CMD_FLAG_VS_PARTIAL_FLUSH | RADV_CMD_FLAG_PS_PARTIAL_FLUSH |
+         RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_WB_L2 |
+         RADV_CMD_FLAG_INV_VCACHE | RADV_CMD_FLAG_INV_SCACHE | RADV_CMD_FLAG_INV_L2;
+      radv_emit_cache_flush(cmd_buffer);
+      ac_emit_cp_pfp_sync_me(cmd_buffer->cs->b, false);
+      cmd_buffer->bc250_task_idx_shared_used = true;
+   }
+   return true;
+}
+
+static bool
+bc250_idx_task_pass(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *pipeline, uint64_t records,
+                    uint32_t max_count, uint64_t count_va, uint64_t payload, uint64_t application_constants,
+                    uint32_t draw_id, unsigned slot, unsigned view, uint32_t draw_view_mask,
+                    uint64_t *mesh_out, uint64_t *table_out)
+{
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   uint64_t pool = 0, shared_tables[2] = {0};
+   uint32_t pool_capacity = 0;
+   const bool shared = bc250_task_idx_shared_storage(cmd_buffer, &pool, &pool_capacity, shared_tables);
+   if (!shared && !cmd_buffer->bc250_idx_pool_bo) {
       const uint64_t pool_bytes = device->bc250_env.idx_pool_bytes;
       uint32_t spare_bytes;
       cmd_buffer->bc250_idx_pool_bo = bc250_idx_spare_take(device, pool_bytes, pool_bytes, true, &spare_bytes);
@@ -9534,38 +9616,37 @@ bc250_idx_task_pass(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pip
       cmd_buffer->bc250_idx_pool = radv_buffer_get_va(cmd_buffer->bc250_idx_pool_bo);
       cmd_buffer->bc250_idx_pool_capacity = (pool_bytes - 256) / 4;
    }
-   if (!cmd_buffer->bc250_idx_pool_used)
+   if (!shared && !cmd_buffer->bc250_idx_pool_used)
       radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, cmd_buffer->bc250_idx_pool_bo);
-   const uint64_t pool = cmd_buffer->bc250_idx_pool;
+   if (!shared) {
+      pool = cmd_buffer->bc250_idx_pool;
+      pool_capacity = cmd_buffer->bc250_idx_pool_capacity;
+   }
    /* Every pass drains the previous readers first (the caller), so two table sets sized for a full producer
     * chunk serve all passes of the command buffer: pass p reads set (p - 1) & 1 and writes set p & 1. */
    assert(max_count <= BC250_TASK_IDX_MAX_CHUNK);
-   if (!cmd_buffer->bc250_task_idx_tables[slot] &&
+   if (!shared && !cmd_buffer->bc250_task_idx_tables[slot] &&
        !bc250_idx_alloc(cmd_buffer, bc250_idx_task_table_bytes(BC250_TASK_IDX_MAX_CHUNK),
                         &cmd_buffer->bc250_task_idx_tables[slot]))
       return false;
-   const uint64_t table = cmd_buffer->bc250_task_idx_tables[slot];
+   const uint64_t table = shared ? shared_tables[slot] : cmd_buffer->bc250_task_idx_tables[slot];
    const uint64_t prefix_bytes = ALIGN_POT(32 + (uint64_t)(max_count + 1) * 4, 16);
    const uint64_t dims_bytes = ALIGN_POT((uint64_t)max_count * 12, 16), draws_bytes = ALIGN_POT((uint64_t)max_count * 20, 16);
    const uint64_t dims = table + prefix_bytes, draws = dims + dims_bytes, mesh = draws + draws_bytes;
-   unsigned coffset;
-   void *cmap;
-   if (!radv_cmd_buffer_upload_alloc_aligned(cmd_buffer, MAX_PUSH_CONSTANTS_SIZE, 256, &coffset, &cmap))
-      return false;
-   memcpy(cmap, cmd_buffer->push_constants, MAX_PUSH_CONSTANTS_SIZE);
    const struct bc250_idx_setup_args args = {
       .records = records, .count = count_va, .table = table, .dims = dims, .draws = draws, .mesh = mesh, .pool = pool,
-      .stride = 12, .max_count = max_count, .capacity = cmd_buffer->bc250_idx_pool_capacity,
+      .stride = 12, .max_count = max_count, .capacity = pool_capacity,
       .prims = pipeline->bc250_idx_primitives, .reset = 1,
       .vertex_stride = pipeline->bc250_idx_vertex_stride, .output_bytes = pipeline->bc250_idx_output_bytes,
    };
    const struct bc250_constants constants = {
       .xyz = table, .payload = pool + 256, .application_draw_id = draw_id,
-      .application_constants = radv_cmd_buffer_upload_va(cmd_buffer) + coffset,
+      .application_constants = application_constants,
       .input = dims, .input_count = draws, .compute_args = payload,
       .split_piece = view, /* ViewIndex of the pass (radv_bc250_idx_build_task_cs) */
    };
-   cmd_buffer->bc250_idx_pool_used = true;
+   if (!shared)
+      cmd_buffer->bc250_idx_pool_used = true;
    cmd_buffer->bc250_diag_idx_indirect++;
    cmd_buffer->bc250_diag_idx_records += max_count;
 
@@ -9584,7 +9665,7 @@ bc250_idx_task_pass(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pip
    ac_emit_cp_pfp_sync_me(cmd_buffer->cs->b, false);
 
    struct bc250_idx_saved saved;
-   bc250_idx_draw_begin(cmd_buffer, pipeline, pool + 256, (uint64_t)cmd_buffer->bc250_idx_pool_capacity * 4, &constants,
+   bc250_idx_draw_begin(cmd_buffer, pipeline, pool + 256, (uint64_t)pool_capacity * 4, &constants,
                         &saved);
    const VkDrawIndirectCount2InfoKHR draw = {.sType = VK_STRUCTURE_TYPE_DRAW_INDIRECT_COUNT_2_INFO_KHR,
       .addressRange = {.address = draws, .size = (uint64_t)max_count * 20, .stride = 20},
@@ -9666,8 +9747,9 @@ bc250_task_idx_consume(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_
                                          RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_VCACHE |
                                          RADV_CMD_FLAG_INV_SCACHE;
          uint64_t mesh, table;
-         if (!bc250_idx_task_pass(cmd_buffer, pipeline, rec, max_count, count, cc->payload, cc->application_draw_id,
-                                  pass & 1, view, draw_view_mask, &mesh, &table)) {
+         if (!bc250_idx_task_pass(cmd_buffer, pipeline, rec, max_count, count, cc->payload,
+                                  cc->application_constants, cc->application_draw_id, pass & 1,
+                                  view, draw_view_mask, &mesh, &table)) {
             if (regions) {
                vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
                return;

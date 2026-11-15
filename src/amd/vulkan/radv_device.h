@@ -220,6 +220,17 @@ struct radv_device {
       bool pool;
    } bc250_idx_spare[32];
    uint32_t bc250_idx_spare_count, bc250_idx_spare_bytes;
+   /* A Task-index pipeline records GPU writes only.  When the device exposes a
+    * single unprotected queue for its command-buffer family, recordings may
+    * share one stable pool and two alternating table sets.  Each recording
+    * emits a first-use drain before it overwrites them. */
+   simple_mtx_t bc250_task_idx_shared_mtx;
+   struct radeon_winsys_bo *bc250_task_idx_shared_bo;
+   uint64_t bc250_task_idx_shared_pool;
+   uint64_t bc250_task_idx_shared_tables[2];
+   uint32_t bc250_task_idx_shared_pool_capacity;
+   uint32_t bc250_task_idx_shared_bytes;
+   bool bc250_task_idx_shared_failed;
    struct radv_bc250_device_env bc250_env;
    /* RADV_BC250_ASYNC_COMPILE: background queue for the optimized Mesh/FS binaries of pipelines that were
     * created with an unoptimized ACO build first (radv_pipeline_graphics.c). */

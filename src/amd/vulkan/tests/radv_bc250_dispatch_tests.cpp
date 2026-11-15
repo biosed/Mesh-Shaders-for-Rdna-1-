@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 #include "../../../../tests/bc250-mesh/dgc/nir_interpreter.h"
 #include "tests/nir_test.h"
+#include "radv_bc250.h"
 #include "radv_bc250_dispatch.h"
 #include "radv_directmesh.h"
 
@@ -60,6 +61,17 @@ protected:
       }
    }
 };
+
+TEST(radv_bc250_task_idx, shared_storage_requires_one_unprotected_queue)
+{
+   EXPECT_TRUE(radv_bc250_task_idx_shared_eligible(true, true, false, 1, 0));
+   EXPECT_FALSE(radv_bc250_task_idx_shared_eligible(false, true, false, 1, 0));
+   EXPECT_FALSE(radv_bc250_task_idx_shared_eligible(true, false, false, 1, 0));
+   EXPECT_FALSE(radv_bc250_task_idx_shared_eligible(true, true, true, 1, 0));
+   EXPECT_FALSE(radv_bc250_task_idx_shared_eligible(true, true, false, 0, 0));
+   EXPECT_FALSE(radv_bc250_task_idx_shared_eligible(true, true, false, 2, 0));
+   EXPECT_FALSE(radv_bc250_task_idx_shared_eligible(true, true, false, 1, 1));
+}
 
 TEST_F(radv_bc250_dispatch_test, row_major_32bit)
 {
@@ -197,6 +209,7 @@ TEST(radv_directmesh, preset_table_matches_previous_setenv_preset)
       {"RADV_BC250_KEEP_IB_KB", "640"},
       {"RADV_BC250_PERF_PIECE_PRIMS", "64"},
       {"RADV_BC250_SCRATCH_REUSE", "1"},
+      {"RADV_BC250_TASK_PERSIST", "1"},
       {"RADV_BC250_MESH_DIRECT_READ", "full"},
       {"RADV_BC250_MESH_AUTOCULL", "1"},
       {"RADV_BC250_MESH_AUTOCULL_WIDE", "1"},
