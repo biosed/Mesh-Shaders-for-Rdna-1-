@@ -8549,7 +8549,7 @@ bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline *pipe
       else if (!(task && pCreateInfo->pStages[i].stage == VK_SHADER_STAGE_TASK_BIT_EXT))
          return;
    }
-   if (!ms_info || !fs_info)
+   if (!ms_info)
       return;
    /* The index route compiles its shaders for view 0 only. */
    const VkPipelineRenderingCreateInfo *rendering = vk_get_pipeline_rendering_create_info(pCreateInfo);
@@ -8564,13 +8564,23 @@ bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline *pipe
    struct radv_shader_stage ms = {0}, fs = {0};
    const struct radv_shader_stage_key ms_key =
       radv_pipeline_get_shader_key(&device->compiler_info, ms_info, pipeline->base.create_flags, pCreateInfo->pNext);
-   const struct radv_shader_stage_key fs_key =
-      radv_pipeline_get_shader_key(&device->compiler_info, fs_info, pipeline->base.create_flags, pCreateInfo->pNext);
    radv_pipeline_stage_init(pipeline->base.create_flags, ms_info, layout, &ms_key, &ms);
-   radv_pipeline_stage_init(pipeline->base.create_flags, fs_info, layout, &fs_key, &fs);
    struct radv_spirv_to_nir_options options = {.lower_view_index_to_zero = !multiview};
    nir_shader *mesh = radv_shader_spirv_to_nir_cached(&device->compiler_info, NULL, &ms, &options, false);
-   nir_shader *frag = radv_shader_spirv_to_nir_cached(&device->compiler_info, NULL, &fs, &options, false);
+   nir_shader *frag = NULL;
+   if (fs_info) {
+      const struct radv_shader_stage_key fs_key =
+         radv_pipeline_get_shader_key(&device->compiler_info, fs_info, pipeline->base.create_flags, pCreateInfo->pNext);
+      radv_pipeline_stage_init(pipeline->base.create_flags, fs_info, layout, &fs_key, &fs);
+      frag = radv_shader_spirv_to_nir_cached(&device->compiler_info, NULL, &fs, &options, false);
+   } else if (mesh) {
+      /* A depth-only pipeline has no fragment stage, but output pruning and
+       * route admission still need a consumer.  An empty analysis-only
+       * fragment shader reads no generic varyings; the internal graphics
+       * pipeline below remains fragment-less. */
+      frag = nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, mesh->options,
+                                            "bc250_idx_empty_fs").shader;
+   }
    nir_shader *cs = NULL, *vs = NULL;
    unsigned output_bytes = 0;
    const char *storage = radv_dm_option("RADV_BC250_MESH_IDXPASS_STORE");
@@ -8582,6 +8592,8 @@ bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline *pipe
       NIR_PASS(_, mesh, nir_split_var_copies);
       NIR_PASS(_, mesh, nir_lower_var_copies);
    }
+   /* This also moves an unconsumed PrimitiveID output to a generic slot so
+    * the empty analysis consumer can prune it before stored-layout creation. */
    if (task && mesh && frag)
       bc250_idx_task_primitive_builtins(mesh, frag);
    if (!mesh || !frag || !bc250_idx_eligible(mesh, frag, task != NULL, &why)) {
@@ -8635,7 +8647,8 @@ bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline *pipe
       vs = radv_bc250_idx_build_stored_vs(&device->compiler_info.nir_options[MESA_SHADER_VERTEX], mesh, output_bytes);
       /* The fetch shader uses the internal constants; preserve application
        * fragment constants through the same immutable per-draw upload. */
-      NIR_PASS(_, frag, nir_shader_intrinsics_pass, bc250_lower_application_constants, nir_metadata_none, (void *)1);
+      if (fs_info)
+         NIR_PASS(_, frag, nir_shader_intrinsics_pass, bc250_lower_application_constants, nir_metadata_none, (void *)1);
    } else {
       vs = bc250_idx_build_vs(device, mesh, &why);
    }
@@ -8648,7 +8661,7 @@ bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline *pipe
       ? vk_find_struct_const(pCreateInfo->pRasterizationState->pNext, PIPELINE_RASTERIZATION_PROVOKING_VERTEX_STATE_CREATE_INFO_EXT)
       : NULL;
    unsigned provoking = provoking_info && provoking_info->provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT ? 2 : 0;
-   if (bc250_idx_has_pp(mesh)) {
+   if (fs_info && bc250_idx_has_pp(mesh)) {
       if (pCreateInfo->pDynamicState) {
          for (unsigned i = 0; i < pCreateInfo->pDynamicState->dynamicStateCount; i++) {
             if (pCreateInfo->pDynamicState->pDynamicStates[i] == VK_DYNAMIC_STATE_PROVOKING_VERTEX_MODE_EXT) {
@@ -8679,7 +8692,8 @@ bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline *pipe
    }
 
    VkPushConstantRange range = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT |
-      (stored ? VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT : 0), .size = sizeof(struct bc250_constants)};
+      (stored ? VK_SHADER_STAGE_VERTEX_BIT | (fs_info ? VK_SHADER_STAGE_FRAGMENT_BIT : 0) : 0),
+      .size = sizeof(struct bc250_constants)};
    VkDescriptorSetLayout sets[MAX_SETS];
    for (unsigned i = 0; i < layout->num_sets; i++)
       sets[i] = layout->set[i].layout ? radv_descriptor_set_layout_to_handle(layout->set[i].layout) : VK_NULL_HANDLE;
@@ -8762,12 +8776,15 @@ bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline *pipe
 
    /* The application's graphics state with a vertex shader in place of the Mesh shader: triangle lists from an
     * index buffer, no vertex attributes. Topology, restart and vertex-input states are not dynamic here. */
-   VkPipelineShaderStageCreateInfo stages[2] = {
-      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
-       .module = vk_shader_module_handle_from_nir(vs), .pName = "main"},
-      *fs_info,
-   };
-   stages[1].module = vk_shader_module_handle_from_nir(frag);
+   VkPipelineShaderStageCreateInfo stages[2] = {{
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
+      .module = vk_shader_module_handle_from_nir(vs), .pName = "main",
+   }};
+   if (fs_info)
+      stages[1] = *fs_info;
+   /* Keep the temporary shader-module compound literal in this outer block:
+    * its lifetime must include radv_CreateGraphicsPipelines below. */
+   stages[1].module = fs_info ? vk_shader_module_handle_from_nir(frag) : VK_NULL_HANDLE;
    stages[1].pSpecializationInfo = NULL; /* Already specialized by SPIR-V to NIR. */
    VkPipelineVertexInputStateCreateInfo vis = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
    VkPipelineInputAssemblyStateCreateInfo ias = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
@@ -8787,7 +8804,7 @@ bc250_idx_create(struct radv_device *device, struct radv_graphics_pipeline *pipe
    VkGraphicsPipelineCreateInfo gci = *pCreateInfo;
    if (stored)
       gci.layout = pipeline->bc250_idx_layout;
-   gci.stageCount = 2;
+   gci.stageCount = fs_info ? 2 : 1;
    gci.pStages = stages;
    gci.pVertexInputState = &vis;
    gci.pInputAssemblyState = &ias;
@@ -9531,7 +9548,9 @@ bc250_idx_draw_begin(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pi
       memcpy(cmd_buffer->push_constants, constants, sizeof(*constants));
    }
    /* The application pushes constants for the Mesh stage. */
-   cmd_buffer->push_constant_stages |= VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+   cmd_buffer->push_constant_stages |= VK_SHADER_STAGE_VERTEX_BIT;
+   if (internal->shaders[MESA_SHADER_FRAGMENT])
+      cmd_buffer->push_constant_stages |= VK_SHADER_STAGE_FRAGMENT_BIT;
    struct radv_dynamic_state *dyn = &cmd_buffer->state.dynamic;
    saved->topology = dyn->vk.ia.primitive_topology;
    saved->restart = dyn->vk.ia.primitive_restart_enable;
